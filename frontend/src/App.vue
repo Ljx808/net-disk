@@ -1,7 +1,7 @@
-<script setup>
-import HelloWorld from './components/HelloWorld.vue'
-</script>
-
 <template>
-  <HelloWorld />
+  <!--
+    根组件只留一个出口：具体显示哪个页面由路由决定。
+    每个页面自己管自己的布局，根组件不掺和样式。
+  -->
+  <router-view />
 </template>
