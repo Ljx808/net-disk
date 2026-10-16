@@ -32,7 +32,7 @@
   - Day 6 文件下载（`GET /api/file/download/{userFileId}` 归属校验 + 流式返回、`Content-Disposition` 中文名 RFC 6266 编码、前端 axios+Blob 下载）
     - 联调补丁一：全局异常处理补上 404/405/415/请求体解析四类框架异常，修掉"URL 打错却显示系统繁忙"的假 500（起因见下方"踩坑记录"）
     - 联调补丁二（2026-10-17）：`GlobalExceptionHandler` 改为**继承 `ResponseEntityExceptionHandler` + 覆写 `handleExceptionInternal`**，整族框架异常收编进统一出口，不再逐个枚举（枚举法天然会漏，`MissingServletRequestPartException` 就是漏掉的那个）。随之批准三处状态码变更，见"已知技术债"里的状态码条目
-- 当前状态：**Day 6 已完成（含上述两个补丁）**，下一步 Day 7 做对账/巡检任务
+- 当前状态：**Day 6 已收工**（下载 → 异常补丁 → 异常处理重构，三笔已提交 `739625c`/`fb9a2b0`/`ff470dc`；`docs/schema.sql` 空库自举已修复并冒烟通过，待提交），下一步 Day 7 做对账/巡检任务
 - 已定路线（顺序不要随意调整）：**Day 6 下载（已完成）→ Day 7 对账/巡检任务 → Day 8 删除/回收站**
   - 对账任务排在删除之前的原因：删除功能一上线，回收站、物理删除、`ref_count` 归零这几个动作会立刻让孤儿文件的成因复杂化，先对账更容易定位
   - **Day 6 范围**（已完成）：按 `user_file` id 下载；校验该记录归属当前登录用户（越权防线）；按 `file_path` + `mime_type` 流式返回（不能整个读进内存）
@@ -75,11 +75,12 @@
   - **硬约束：所有响应（含上述每一个分支）必须保持 `Result` 信封（code/message/data）不变**，前端拦截器按信封解析的行为不受影响。
   - **仍未偿还的部分**：业务异常 `BusinessException` 里，只有 `404xx` 映射成真 HTTP 404，其余业务码（401、400……）**仍然 HTTP 200 + body 里放 code**。这是有意的保守做法：改动会牵动 Day 2~Day 5 已验收的接口与前端拦截器。后续若统一，方向是把 `toHttpStatus` 从"只认 404xx"扩展成按区间/枚举映射，并同步前端拦截器。
   - **实现上的两个坑（实测踩到，别凭直觉改代码）**：① 父类那个 `final handleException` 上挂的是 **20 个具体类型**的 `@ExceptionHandler`，这些类型在本类里**不能再写 `@ExceptionHandler`**，否则**启动即抛** `IllegalStateException: Ambiguous @ExceptionHandler method mapped for [...]`——想改提示只能覆写同签名的 `protected` 钩子（`handleMaxUploadSizeExceededException` / `handleMethodArgumentNotValid` / `handleTypeMismatch`）。② **`Exception.class` 父类不管**，所以本类必须自己保留 `@ExceptionHandler(Exception.class)` 兜底，否则意外异常会绕过 advice 走 Spring Boot 默认 `/error`，响应结构就不再是 `Result` 信封了。
-- **`docs/schema.sql` 建不出能跑的库（Day 6 发现，未修）**
-  - 现象：`CREATE TABLE user (...)` 在文件末尾被注释掉了（标注"已有的 user 表结构，仅供对照，不要重复执行"），文件里实际只有 `real_file`、`user_file` 两张可执行的建表语句。但项目约定写明"三张表以 `docs/schema.sql` 为准"，两者对不上。
-  - 影响：拿这个文件在一台干净机器/空库上初始化，得到的库缺 `user` 表，注册和登录会直接报 `Table 'xxx.user' doesn't exist`。Day 6 用临时验证库时就踩到了：临时库是我用这个文件建的，注册直接 500，只能临时 `CREATE TABLE net_disk_verify.user LIKE net_disk.user` 兜住才把回归跑完。
-  - 建议形态：取消注释并改成 `CREATE TABLE IF NOT EXISTS \`user\` (...)`，这样"空库能建、已有库不报错"两个诉求同时满足，"不要重复执行"的顾虑就没了。
-  - 暂不修的原因：`user` 表是 Day 2 手工建的，改不改由作者定；且文件是"唯一真相来源"，改动前要确认一遍与真实库结构完全一致（可直接用 `SHOW CREATE TABLE net_disk.user` 的输出核对）。
+- **`docs/schema.sql` 建不出能跑的库（Day 6 发现 → 2026-10-17 已修）**
+  - 现象（修复前）：`CREATE TABLE user (...)` 在文件末尾被注释掉了（标注"已有的 user 表结构，仅供对照，不要重复执行"），文件里实际只有 `real_file`、`user_file` 两张可执行的建表语句。但项目约定写明"三张表以 `docs/schema.sql` 为准"，两者对不上。
+  - 影响（修复前）：拿这个文件在一台干净机器/空库上初始化，得到的库缺 `user` 表，注册和登录会直接报 `Table 'xxx.user' doesn't exist`。Day 6 起临时验证库时就踩到了，只能临时 `CREATE TABLE net_disk_verify.user LIKE net_disk.user` 兜住才把回归跑完。
+  - **已修（2026-10-17）**：① `user` 表取消注释，DDL 由 `SHOW CREATE TABLE net_disk.user` **原样抄回**，含反引号与**列级 `COLLATE utf8mb4_unicode_ci`**——这一条不能省：有些环境建库的默认 collation 不是 `unicode_ci`（实测新建库默认 `utf8mb4_general_ci`），靠列级 COLLATE 才能保证无论库怎么建，这张表的排序规则都与线上一致；唯一没照抄的是 `AUTO_INCREMENT=3`，那是运行时的自增值、属于数据不属于结构，写进去会让新库从 3 开始编号。② 三张表统一 `CREATE TABLE IF NOT EXISTS`，重复执行不报错。③ 章节顺序调整为 `user` → `real_file` → `user_file`。
+  - **验收（空库冒烟，2026-10-17）**：新建 `net_disk_smoke`（只指定 utf8mb4、库默认 collation 是 `utf8mb4_general_ci`）→ **只跑 `docs/schema.sql`** → 三表齐 → `SHOW CREATE TABLE user` 与线上净掉 `AUTO_INCREMENT` 后**逐字一致** → 注册 `smoke_user` 成功（BCrypt `$2a$10$`、60 字符）→ 登录/上传/列表/下载三张表全通 → DROP 库、删临时存储目录。
+  - 遗留观察（不需要修）：`file_info`（Day 2 旧表）的 `DROP` 语句仍是注释，需要人工确认是空表后手工执行——旧表清理本来就不该进自动化脚本。
 
 ## 踩坑记录（排查案例）
 - **Day 6：8080 上下载报"系统繁忙"，真凶是旧构建 + 假 500**
@@ -102,6 +103,7 @@
   （Day 4 只覆盖了数据源、漏了存储目录，是上面那 4 个孤儿的成因之一，所以这条写死在这里。）
 - **验收矩阵必须有两档：临时档 + 真实档**。两档都要过，缺一档不算验收完。
   - **临时档**（临时库 + 临时存储目录）：唯一能放开写操作的地方。上传、删除、注册这类会改数据的用例只在这里跑，可以随便造数据、故意调小参数（如把 `max-file-size` 调成 1KB 来测超限），跑完 DROP 库、删目录。
+    - **起临时库必须且只能用 `docs/schema.sql`**：手工 `CREATE TABLE`、或从别的库 `CREATE TABLE ... LIKE` 抄结构，都不算数——那样只能证明"被测代码能跑"，证明不了"这份 schema 文件本身在空库上自举得出来"。schema 漂移（少张表、少个列、collation 不一致）是最容易攒、又最难在开发机上发现的债，而每次起临时库都是一次免费的校验机会。2026-10-17 `docs/schema.sql` 补上 `user` 表后，这条升级为硬纪律（当时就是因为起临时库时只能 `LIKE` 抄表，才暴露了 schema 文件缺 `user` 表）。
   - **真实档**（真实例 + 真库 `net_disk` + 真存储 `D:\net-disk-storage`）：验证"真实数据形态 + 真实配置 + 真实构建"这三件事，临时档天然证明不了。启动时**只覆盖端口**（`--server.port=xxxx`），数据源和存储根路径都用 `application.yml` 原样值；**只发 GET（列表/下载）等只读请求，不写库**。确需写入的用例，先列出会写哪些行、哪些文件，测完核对基线。
   - **动手前先确认实例加载的是最新构建**：对比进程启动时间与 `target/classes` 的时间戳。Day 6 那次"8080 下载假 500"就是旧构建造成的（详见上方踩坑记录），先看这一条能省很多时间。
   - **真实档只读测试必须留指纹**：跑前跑后各取一次"真库三张表行数 + 存储目录 路径/大小/修改时间 的 md5"，两次一致才算零污染。

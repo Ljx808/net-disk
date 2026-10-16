@@ -1,8 +1,10 @@
 -- ============================================================================
--- 云盘系统 · 文件表结构（Day 4）
--- 在 DataGrip 里连上 net_disk 库后执行本文件
+-- 云盘系统 · 建表脚本（三张表）
+-- 空库可自举：新库连上去直接跑本文件即可，已有的库重复跑也不会报错
+--   （模板：mysql -uroot -p <库名> < docs/schema.sql）
 -- ============================================================================
 -- 设计要点（面试可讲）：把"物理文件"和"用户的文件记录"拆成两张表。
+--   user      ：用户账号，密码存 BCrypt 密文，容量上限挂在用户上
 --   real_file ：磁盘上真实存在的文件，按 md5 唯一，全站只存一份
 --   user_file ：用户看到的文件，一个用户一条记录，指向 real_file
 -- 好处：同一个文件被 10 个用户上传，磁盘上只有 1 份；
@@ -11,7 +13,29 @@
 
 
 -- ----------------------------------------------------------------------------
--- 1. 物理文件表
+-- 1. 用户表
+-- ----------------------------------------------------------------------------
+-- 说明：本表的 DDL 由 `SHOW CREATE TABLE net_disk.user` 原样抄回，
+--       包括列级 COLLATE utf8mb4_unicode_ci —— 不能省。
+--       有些环境建库时用的不是 utf8mb4，列级 COLLATE 能保证无论库的默认字符集
+--       是什么，这张表的排序规则都和线上一致（用户名唯一索引按这个规则比较）。
+--       唯一没有照抄的是 `AUTO_INCREMENT=3`：那是运行时的自增值，属于数据不属于结构，
+--       写进来会让新库从 3 开始编号。
+CREATE TABLE IF NOT EXISTS `user` (
+  `id` bigint(20) NOT NULL AUTO_INCREMENT,
+  `username` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '用户名',
+  `password` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '密码(BCrypt加密)',
+  `email` varchar(100) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `storage_limit` bigint(20) NOT NULL DEFAULT '1073741824' COMMENT '网盘容量上限,默认1GB',
+  `create_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `update_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `username` (`username`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户表';
+
+
+-- ----------------------------------------------------------------------------
+-- 2. 物理文件表
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `real_file` (
   `id`          bigint(20)   NOT NULL AUTO_INCREMENT,
@@ -28,7 +52,7 @@ CREATE TABLE IF NOT EXISTS `real_file` (
 
 
 -- ----------------------------------------------------------------------------
--- 2. 用户文件表
+-- 3. 用户文件表
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `user_file` (
   `id`           bigint(20)   NOT NULL AUTO_INCREMENT,
@@ -48,25 +72,9 @@ CREATE TABLE IF NOT EXISTS `user_file` (
 
 
 -- ----------------------------------------------------------------------------
--- 3. 可选：删掉 Day2 遗留的空表 file_info
+-- 4. 可选：删掉 Day2 遗留的空表 file_info
 --    该表是旧的单表设计（物理文件信息挂在用户记录上），已改用上面两张表。
---    确认它确实是空表、且你不再需要后再执行：
+--    确认它确实是空表、且你不再需要后再执行（注意：本文件不包含这条，需手工执行）：
 -- ----------------------------------------------------------------------------
 -- SELECT COUNT(*) FROM file_info;   -- 先确认是 0
 -- DROP TABLE `file_info`;
-
-
--- ============================================================================
--- 附：已有的 user 表结构（仅供对照，不要重复执行）
--- ============================================================================
--- CREATE TABLE `user` (
---   `id`            bigint(20)   NOT NULL AUTO_INCREMENT,
---   `username`      varchar(50)  NOT NULL COMMENT '用户名',
---   `password`      varchar(100) NOT NULL COMMENT '密码(BCrypt加密)',
---   `email`         varchar(100) DEFAULT NULL,
---   `storage_limit` bigint(20)   NOT NULL DEFAULT '1073741824' COMMENT '网盘容量上限,默认1GB',
---   `create_time`   datetime     NOT NULL DEFAULT CURRENT_TIMESTAMP,
---   `update_time`   datetime     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
---   PRIMARY KEY (`id`),
---   UNIQUE KEY `username` (`username`)
--- ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户表';
