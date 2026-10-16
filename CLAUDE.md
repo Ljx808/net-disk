@@ -30,8 +30,9 @@
   - Day 4 单文件上传（real_file + user_file 双表设计、md5 服务端秒传、StorageService 抽象）
   - Day 5 文件列表（`GET /api/file/list` 分页查根目录未删除文件、两次查询组装、分页参数夹紧）
   - Day 6 文件下载（`GET /api/file/download/{userFileId}` 归属校验 + 流式返回、`Content-Disposition` 中文名 RFC 6266 编码、前端 axios+Blob 下载）
-    - 联调补丁：全局异常处理新增 404/405/415/请求体解析四类框架异常的处理器，修掉"URL 打错却显示系统繁忙"的假 500（起因见下方"踩坑记录"）
-- 当前状态：**Day 6 已完成（含上述补丁）**，下一步 Day 7 做对账/巡检任务
+    - 联调补丁一：全局异常处理补上 404/405/415/请求体解析四类框架异常，修掉"URL 打错却显示系统繁忙"的假 500（起因见下方"踩坑记录"）
+    - 联调补丁二（2026-10-17）：`GlobalExceptionHandler` 改为**继承 `ResponseEntityExceptionHandler` + 覆写 `handleExceptionInternal`**，整族框架异常收编进统一出口，不再逐个枚举（枚举法天然会漏，`MissingServletRequestPartException` 就是漏掉的那个）。随之批准三处状态码变更，见"已知技术债"里的状态码条目
+- 当前状态：**Day 6 已完成（含上述两个补丁）**，下一步 Day 7 做对账/巡检任务
 - 已定路线（顺序不要随意调整）：**Day 6 下载（已完成）→ Day 7 对账/巡检任务 → Day 8 删除/回收站**
   - 对账任务排在删除之前的原因：删除功能一上线，回收站、物理删除、`ref_count` 归零这几个动作会立刻让孤儿文件的成因复杂化，先对账更容易定位
   - **Day 6 范围**（已完成）：按 `user_file` id 下载；校验该记录归属当前登录用户（越权防线）；按 `file_path` + `mime_type` 流式返回（不能整个读进内存）
@@ -57,14 +58,23 @@
   - 影响：只占磁盘空间，不影响功能（没有任何接口会读到它们）。
   - 清理方案（挂账到"对账任务"）：扫描存储根目录得到磁盘文件集合，查 `real_file` 得到应存集合，取差集就是孤儿候选；删除前必须满足两个条件 —— ① 该文件确实没有任何记录引用，② 文件创建时间早于 N 天。第 ② 条不能省：`saveNewRealFile` 是"先落盘、再插库"，中间存在短暂的时间窗口，不讲时间条件的对账会误删正在上传中的文件。
   - 反向对账（同样属于这个任务）：`real_file` 有记录但磁盘文件不存在的情况（Day 4 已记录过这个风险），以及 `ref_count` 与实际引用它的 `user_file` 行数是否对得上。
-- **HTTP 状态码与业务码不完全一致（Day 6 引入，部分修补）**
-  - 现状：全局异常处理只把 `40400~40499` 区间映射成真实 HTTP 404（为了配合浏览器和 axios 的通用错误处理），其余**业务异常**一律 **HTTP 200 + `Result.code` 里放业务码**。所以同一个业务错误，可能出现"HTTP 200 但 code=400"（如 `userFileId=abc` 的参数格式错误）这种表里不一的情况。
-  - 影响：接口语义不统一，前端不能只看 HTTP 状态码判断成败，必须同时解析响应体；接入第三方或做网关限流/监控时容易误判。好处是改动面小、不影响既有前端拦截器逻辑（它本来就优先看 `code`）。
-  - **已修补的部分（Day 6 联调补丁）**：框架自己已经给出语义的异常不再掉进兜底 500，改为返回真实状态码 + 可识别业务码 —— `NoResourceFoundException` → 404/`40400`、`HttpRequestMethodNotSupportedException` → 405/`40500`、`HttpMediaTypeNotSupportedException` → 415/`41500`、`HttpMessageNotReadableException` → 400/`40001`、`MultipartException` → 400/`40002`。
-  - **仍未覆盖的（挂账）**：`MissingServletRequestPartException`（multipart 请求里少了必需的 `file` 部件）等其余 Servlet 绑定类异常仍会掉进兜底 500。实测复现：`curl -X POST /api/file/upload -H 'Content-Type: multipart/form-data; boundary=B1' --data-binary` 一个只有 `name="other"` 部件的报文 → `HTTP 200 + code:500 系统繁忙`（真实异常是 `Required part 'file' is not present.`，语义应是 400）。
-  - **彻底做法（建议）**：让 `GlobalExceptionHandler` 继承 `ResponseEntityExceptionHandler` 并覆写 `handleExceptionInternal`，一次性接管整族框架异常，就不用再逐个枚举（枚举法天然会漏）。等 Day 8 之后接口定型再做。
-  - 建议形态：后续统一成"HTTP 状态码 = 业务错误的语义类别（400/401/403/404/409/500），`Result.code` 保留更细的业务码"，即把 `toHttpStatus` 从"只认 404xx"扩展成按区间/枚举映射，并同步前端拦截器。
-  - 暂不修的原因：Day 6 已按裁决只放开 404xx（+ 上述框架异常），全量改造会牵动 Day 2~Day 5 已验收的所有接口和前端拦截器，风险大于收益；等接口稳定或接入网关时一并做。
+- **HTTP 状态码与业务码不完全一致（Day 6 引入 → 2026-10-17 框架异常部分已偿还）**
+  - **已偿还（2026-10-17，重构 `GlobalExceptionHandler`）**：`GlobalExceptionHandler` 改为**继承 `ResponseEntityExceptionHandler` + 覆写 `handleExceptionInternal`**，由父类一次性接管整族框架异常（不再逐个枚举——枚举法天然会漏，`MissingServletRequestPartException` 就是漏掉的那个），所有分支都从 `handleExceptionInternal` 这一个出口包成 `Result` 信封。框架异常的 code 统一取 **`HTTP 状态码 × 100`**：
+    | 场景 | HTTP | code |
+    |---|---|---|
+    | URL 不存在 / 接口没加载（`NoResourceFoundException`） | 404 | `40400` |
+    | 请求方法不支持（`HttpRequestMethodNotSupportedException`） | 405 | `40500` |
+    | Content-Type 不支持（`HttpMediaTypeNotSupportedException`） | 415 | `41500` |
+    | 参数校验失败（`@Valid`）、JSON 语法错、少了必需部件（`MissingServletRequestPartException`）、参数类型错（`pageNum=abc`）、文件超上限 | 400 | `40000` |
+    | 未预期的意外异常（兜底） | 500 | `50000` |
+  - **三处行为变更（2026-10-17 裁决批准，超出原先"只有 404xx 映射真 404"的最小化范围）**：
+    ① `@Valid` 校验失败与参数类型错误（如 `pageNum=abc`）从 `HTTP 200 + code 400` 改为**真 HTTP 400** + `40000`；
+    ② 未预期的意外异常从 `HTTP 200 + code 500` 改为**真 HTTP 500** + `50000`；
+    ③ 业务码 **`40001`（请求体解析失败）、`40002`（multipart 格式错）废止**，统一并入 `40000`。粒度损失可接受——前端拦截器只看 `code` 是否为零，不依赖具体数值。
+    批准理由：原"维持现状"是最小化热改动的权宜，不是对 HTTP 200 包裹的认可；真状态码让 nginx 日志和监控能看见错误。
+  - **硬约束：所有响应（含上述每一个分支）必须保持 `Result` 信封（code/message/data）不变**，前端拦截器按信封解析的行为不受影响。
+  - **仍未偿还的部分**：业务异常 `BusinessException` 里，只有 `404xx` 映射成真 HTTP 404，其余业务码（401、400……）**仍然 HTTP 200 + body 里放 code**。这是有意的保守做法：改动会牵动 Day 2~Day 5 已验收的接口与前端拦截器。后续若统一，方向是把 `toHttpStatus` 从"只认 404xx"扩展成按区间/枚举映射，并同步前端拦截器。
+  - **实现上的两个坑（实测踩到，别凭直觉改代码）**：① 父类那个 `final handleException` 上挂的是 **20 个具体类型**的 `@ExceptionHandler`，这些类型在本类里**不能再写 `@ExceptionHandler`**，否则**启动即抛** `IllegalStateException: Ambiguous @ExceptionHandler method mapped for [...]`——想改提示只能覆写同签名的 `protected` 钩子（`handleMaxUploadSizeExceededException` / `handleMethodArgumentNotValid` / `handleTypeMismatch`）。② **`Exception.class` 父类不管**，所以本类必须自己保留 `@ExceptionHandler(Exception.class)` 兜底，否则意外异常会绕过 advice 走 Spring Boot 默认 `/error`，响应结构就不再是 `Result` 信封了。
 - **`docs/schema.sql` 建不出能跑的库（Day 6 发现，未修）**
   - 现象：`CREATE TABLE user (...)` 在文件末尾被注释掉了（标注"已有的 user 表结构，仅供对照，不要重复执行"），文件里实际只有 `real_file`、`user_file` 两张可执行的建表语句。但项目约定写明"三张表以 `docs/schema.sql` 为准"，两者对不上。
   - 影响：拿这个文件在一台干净机器/空库上初始化，得到的库缺 `user` 表，注册和登录会直接报 `Table 'xxx.user' doesn't exist`。Day 6 用临时验证库时就踩到了：临时库是我用这个文件建的，注册直接 500，只能临时 `CREATE TABLE net_disk_verify.user LIKE net_disk.user` 兜住才把回归跑完。
