@@ -33,3 +33,20 @@ export function getFileList(params) {
 export function getUploadConfig() {
   return request.get('/file/config')
 }
+
+/**
+ * 下载文件，返回 Blob。
+ *
+ * 为什么不能用 window.open(url) 或 <a href>：
+ * JWT 存在 localStorage 里，是靠 axios 请求拦截器手动加 Authorization 头的。
+ * 而 window.open / <a href> 是浏览器自己发起的导航请求，我们没有任何机会插手加头，
+ * 后端拦截器拿不到 token → 必然 401。
+ * （反过来说：如果认证走 Cookie，浏览器会自动带上，那时 <a href> 是能直接用的。
+ *   token 方案换来了免疫 CSRF，代价就是下载这类请求必须自己用 XHR 拉。)
+ *
+ * responseType: 'blob' 是必须的：不加的话 axios 会把二进制按文本解析，文件直接损坏。
+ * 超时给 60 秒，和上传同理，大文件下载比普通接口慢得多。
+ */
+export function downloadFile(id) {
+  return request.get(`/file/download/${id}`, { responseType: 'blob', timeout: 60000 })
+}

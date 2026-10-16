@@ -1,5 +1,7 @@
 package backned.service;
 
+import org.springframework.core.io.Resource;
+
 import java.io.InputStream;
 
 /**
@@ -34,4 +36,25 @@ public interface StorageService {
      * @return 是否真的删掉了（文件本来就不存在也算成功）
      */
     boolean delete(String relativePath);
+
+    /**
+     * 打开一个已存储的文件供读取。
+     * <p>
+     * 为什么返回 Resource 而不是 Path 或 byte[]：
+     * <ul>
+     *   <li>返回 byte[]：整个文件进内存，下载大文件直接 OOM，直接排除；</li>
+     *   <li>返回 Path：只对"文件在本地磁盘上"成立，换成 OSS 以后根本没有本地路径，
+     *       这个抽象就废了 —— 而"能换成 OSS"正是这个接口存在的理由；</li>
+     *   <li>返回 Resource：磁盘实现给 FileSystemResource，OSS 实现给 InputStreamResource，
+     *       上层都能直接交给 Spring MVC 流式输出，两边都在同一个抽象下。</li>
+     * </ul>
+     * 注：这个接口原本只依赖 java.io，加入 Resource 后多依赖了 spring-core。
+     * 这是有意的让步 —— "能读出内容"是存储抽象的核心职责，
+     * 而 Resource 是磁盘和对象存储都满足的最小公共抽象。
+     * <p>
+     * 这里只返回句柄，不读文件内容；文件是否存在由调用方通过 {@code resource.exists()} 判断。
+     *
+     * @param relativePath save() 返回的那个相对路径
+     */
+    Resource load(String relativePath);
 }

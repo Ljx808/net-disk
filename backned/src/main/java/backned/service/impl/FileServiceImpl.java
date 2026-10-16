@@ -8,6 +8,7 @@ import backned.mapper.UserFileMapper;
 import backned.service.FileService;
 import backned.service.StorageService;
 import backned.utils.UserContext;
+import backned.vo.DownloadFileVO;
 import backned.vo.FileItemVO;
 import backned.vo.FileUploadVO;
 import backned.vo.PageVO;
@@ -18,6 +19,7 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.Resource;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.util.DigestUtils;
@@ -194,6 +196,62 @@ public class FileServiceImpl implements FileService {
     }
 
     /**
+     * 下载：校验归属 → 定位物理文件 → 把句柄交给 controller 去流式输出。
+     * <p>
+     * 这个方法里一个字节的文件内容都没读，读的动作发生在 controller 返回后的
+     * 消息转换阶段。所以它执行得很快，不会因为文件大而占内存或长时间持有连接。
+     */
+    @Override
+    public DownloadFileVO download(Long userFileId) {
+        Long userId = UserContext.getUserId();
+        if (userId == null) {
+            throw new BusinessException(401, "未登录");
+        }
+
+        // 归属校验：user_id 和 is_delete 都写进 WHERE。
+        // "记录不存在"、"是别人的"、"已进回收站"三种情况在 SQL 层面就是同一个结果 —— 查不到，
+        // 所以代码里只有一个分支，也就不存在"忘了比对 userId"这种低级错误的可能。
+        UserFile userFile = userFileMapper.selectOne(new LambdaQueryWrapper<UserFile>()
+                .eq(UserFile::getId, userFileId)
+                .eq(UserFile::getUserId, userId)
+                .eq(UserFile::getIsDelete, 0));
+        if (userFile == null) {
+            // 三种情况统一 40401、统一文案，故意不做区分：
+            // 如果"不是你的"返回 403、"不存在"返回 404，攻击者拿状态码差异就能
+            // 探测出某个 id 是否存在（文件存在性泄露），能遍历出别人有哪些文件
+            throw new BusinessException(40401, "文件不存在或无权访问");
+        }
+
+        RealFile realFile = realFileMapper.selectById(userFile.getRealFileId());
+        if (realFile == null) {
+            // 数据不一致：user_file 一定指向一条 real_file 记录，指向的没了说明库被改坏了。
+            // 这是要人处理的问题，所以记 error；但对外文案保持中性，不把内部结构暴露给用户
+            log.error("数据不一致: user_file 指向的 real_file 不存在. userFileId={}, realFileId={}",
+                    userFile.getId(), userFile.getRealFileId());
+            throw new BusinessException(40402, "文件内容缺失，请重新上传");
+        }
+
+        // 只拿句柄，不读内容；文件在不在由 exists() 判断
+        Resource resource = storageService.load(realFile.getFilePath());
+        if (!resource.exists()) {
+            // 另一种数据不一致：记录在、磁盘上没有（手工删了文件、磁盘挂了、迁移漏了）。
+            // 同样记 error 但对外 40402 —— 绝不能让它冒成 500，
+            // 500 的意思是"服务端出故障了"，而这个用户的文件本身也确实是拿不到了
+            log.error("数据不一致: 磁盘上的物理文件缺失. realFileId={}, path={}",
+                    realFile.getId(), realFile.getFilePath());
+            throw new BusinessException(40402, "文件内容缺失，请重新上传");
+        }
+
+        DownloadFileVO vo = new DownloadFileVO();
+        // 下载时给用户的名字用 user_file.filename（他当初上传时的名字），
+        // 不是磁盘上那个 UUID 文件名 —— 后者是服务端的内部实现
+        vo.setFilename(userFile.getFilename());
+        vo.setMimeType(realFile.getMimeType());
+        vo.setResource(resource);
+        return vo;
+    }
+
+    /**
      * 落盘 + 插入 real_file 记录。
      * <p>
      * 顺序是"先写磁盘，再写数据库"：反过来的话，数据库插入成功但磁盘写失败，
@@ -243,21 +301,32 @@ public class FileServiceImpl implements FileService {
     /**
      * 清洗原始文件名。
      * <p>
-     * 这个方法的返回值只用来存数据库、展示给用户，永远不会拼成磁盘路径
+     * 这个方法的返回值只用来存数据库、展示给用户、拼进下载响应头，永远不会拼成磁盘路径
      * （磁盘文件名是服务端生成的 UUID），所以不用怕 "../" 这种路径穿越。
-     * 但还是要处理三件事：客户端可能传完整路径、可能传空、可能超长。
+     * 但还是要处理四件事：可能带控制字符、可能带完整路径、可能为空、可能超长。
      */
     private String sanitizeFilename(String original) {
-        if (original == null || original.isBlank()) {
+        if (original == null) {
             return "unnamed";
         }
-        // 有些客户端（尤其是老 IE / 某些 SDK）会把整个路径塞进 originalFilename
-        String name = original.replace('\\', '/');
+
+        // 1. 先剥掉控制字符（\r \n \t 以及各种不可见字符）。
+        //    这一步是 Day6 加的：文件名现在会被拼进下载响应头的 Content-Disposition，
+        //    留着 \r\n 的话，攻击者把文件名取成 "a.txt\r\nX-Injected: 1" 就能往响应里
+        //    注入额外的头（响应头注入 / HTTP 响应拆分）。
+        //    下载接口拼头之前还会再剥一遍 —— 两边都做，因为库里可能还留着
+        //    这道过滤加上之前存进来的存量数据，光靠入库时消毒救不了它们。
+        String name = original.replaceAll("\\p{Cntrl}", "");
+
+        // 2. 有些客户端（尤其是老 IE / 某些 SDK）会把整个路径塞进 originalFilename
+        name = name.replace('\\', '/');
         name = name.substring(name.lastIndexOf('/') + 1).trim();
+
+        // 3. 剥完控制字符后名字可能变空（比如原本就是 "\r\n"），所以判空放在剥完之后
         if (name.isEmpty() || ".".equals(name) || "..".equals(name)) {
             return "unnamed";
         }
-        // 数据库字段是 varchar(255)，按字符截断留点余量，避免超出长度导致插入失败
+        // 4. 数据库字段是 varchar(255)，按字符截断留点余量，避免超出长度导致插入失败
         if (name.length() > 200) {
             name = name.substring(0, 200);
         }

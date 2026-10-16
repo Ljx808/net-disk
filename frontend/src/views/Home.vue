@@ -3,7 +3,7 @@ import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useUserStore } from '@/stores/user'
-import { getFileList, getUploadConfig, uploadFile } from '@/api/file'
+import { downloadFile, getFileList, getUploadConfig, uploadFile } from '@/api/file'
 
 const router = useRouter()
 const userStore = useUserStore()
@@ -118,6 +118,51 @@ function handleLogout() {
   router.push('/login')
 }
 
+/** 正在下载的那一行（存 user_file id），用来只给这一行的按钮转圈 */
+const downloadingId = ref(null)
+
+/**
+ * 把 Blob 保存成本地文件。
+ *
+ * 流程：Blob → 临时 ObjectURL → 造一个隐藏的 <a download> 点一下 → 释放 ObjectURL。
+ * 注意最后一定要 revokeObjectURL：它创建的 URL 会一直持有这块内存，
+ * 不释放的话每次下载都漏一点，直到页面关闭。
+ */
+function saveBlob(blob, filename) {
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(url)
+}
+
+async function handleDownload(row) {
+  downloadingId.value = row.id
+  try {
+    const blob = await downloadFile(row.id)
+
+    // 兜底：正常情况下后端出错会返回 HTTP 404 + JSON，走下面的 catch 分支。
+    // 但如果哪天后端把错误又改回 "HTTP 200 + Result JSON"，这个 Blob 里装的
+    // 其实是报错信息，直接保存下去用户会得到一个内容是 JSON 的怪文件。
+    // 所以保存前先看一眼类型。
+    if (blob.type && blob.type.includes('json')) {
+      const parsed = JSON.parse(await blob.text())
+      ElMessage.error(parsed.message || '下载失败')
+      return
+    }
+
+    saveBlob(blob, row.filename)
+    ElMessage.success(`已开始下载：${row.filename}`)
+  } catch (e) {
+    // 失败提示已经由 axios 响应拦截器弹过（它会从 Blob 里把后端的文案解析出来）
+  } finally {
+    downloadingId.value = null
+  }
+}
+
 onMounted(() => {
   // userInfo 这次请求同时验证了两件事：token 能通过后端拦截器、info 接口不返回密码。
   // 如果 token 失效，拦截器会弹出提示并自动跳回登录页，所以这里只需吞掉异常。
@@ -166,6 +211,18 @@ onMounted(() => {
         </el-table-column>
         <el-table-column label="上传时间" width="180">
           <template #default="{ row }">{{ formatTime(row.createTime) }}</template>
+        </el-table-column>
+        <el-table-column label="操作" width="90" align="center">
+          <template #default="{ row }">
+            <el-button
+              text
+              type="primary"
+              :loading="downloadingId === row.id"
+              @click="handleDownload(row)"
+            >
+              下载
+            </el-button>
+          </template>
         </el-table-column>
       </el-table>
 

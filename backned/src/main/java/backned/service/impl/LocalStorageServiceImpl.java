@@ -5,6 +5,8 @@ import backned.service.StorageService;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
@@ -79,6 +81,16 @@ public class LocalStorageServiceImpl implements StorageService {
             log.warn("物理文件删除失败: {}", relativePath, e);
             return false;
         }
+    }
+
+    @Override
+    public Resource load(String relativePath) {
+        // resolve() 里带了越界检查，路径非法会直接抛异常
+        Path path = resolve(relativePath);
+        // 只返回句柄，一个字节都不读。真正的读取发生在 Spring 的
+        // ResourceHttpMessageConverter 里，它用 8KB 缓冲区循环 write 到响应流，
+        // 所以文件多大都不会整个进堆内存。
+        return new FileSystemResource(path);
     }
 
     /**
