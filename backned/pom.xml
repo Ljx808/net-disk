@@ -74,6 +74,17 @@
             <artifactId>mybatis-plus-spring-boot4-starter</artifactId>
             <version>3.5.17</version>
         </dependency>
+        <!--
+            分页插件所在的模块。MyBatis-Plus 从 3.5.9 起把"需要 JSqlParser 解析 SQL"的
+            内置拦截器（分页 PaginationInnerInterceptor、防全表更新 BlockAttackInnerInterceptor 等）
+            从 mybatis-plus-extension 拆到了这里，starter 不再自动带上。
+            不引这个依赖，写 PaginationInnerInterceptor 会直接编译不过。
+        -->
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-jsqlparser</artifactId>
+            <version>3.5.17</version>
+        </dependency>
 
         <!-- JWT：jjwt-api 编译期用，impl/jackson 运行期才需要 -->
         <dependency>

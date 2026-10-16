@@ -5,6 +5,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
 
 import java.util.stream.Collectors;
@@ -38,6 +39,18 @@ public class GlobalExceptionHandler {
                 .collect(Collectors.joining("；"));
         log.warn("参数校验失败: {}", message);
         return Result.error(400, message);
+    }
+
+    /**
+     * 参数类型不对，比如 GET /api/file/list?pageNum=abc。
+     * <p>
+     * 不单独处理的话会掉进最下面的兜底分支，返回"系统繁忙"——
+     * 把调用方传错参数说成服务端故障，排查问题时会被彻底带偏。
+     */
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    public Result<Void> handleTypeMismatch(MethodArgumentTypeMismatchException e) {
+        log.warn("参数类型不匹配: name={}, value={}", e.getName(), e.getValue());
+        return Result.error(400, "参数 " + e.getName() + " 格式不正确");
     }
 
     /**

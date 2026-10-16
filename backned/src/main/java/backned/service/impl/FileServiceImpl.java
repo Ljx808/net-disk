@@ -8,19 +8,29 @@ import backned.mapper.UserFileMapper;
 import backned.service.FileService;
 import backned.service.StorageService;
 import backned.utils.UserContext;
+import backned.vo.FileItemVO;
 import backned.vo.FileUploadVO;
+import backned.vo.PageVO;
+import backned.vo.UploadConfigVO;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.util.DigestUtils;
+import org.springframework.util.unit.DataSize;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * 文件业务实现。
@@ -30,9 +40,20 @@ import java.time.LocalDateTime;
 @RequiredArgsConstructor
 public class FileServiceImpl implements FileService {
 
+    /** 单页最大条数。pageSize 是前端传的，能传多大由服务端说了算 */
+    private static final long MAX_PAGE_SIZE = 100L;
+
     private final RealFileMapper realFileMapper;
     private final UserFileMapper userFileMapper;
     private final StorageService storageService;
+
+    /**
+     * 单文件大小上限，直接读 multipart 配置。
+     * "100MB" 这种带单位的字符串 Spring 会自动转成 DataSize，不用自己解析。
+     * 这样 yml 改了配置，这里的值和 GlobalExceptionHandler 的提示语会一起变。
+     */
+    @Value("${spring.servlet.multipart.max-file-size}")
+    private DataSize maxFileSize;
 
     /**
      * 上传流程：算 md5 → 找物理文件 → 决定要不要落盘 → 插用户记录。
@@ -104,6 +125,72 @@ public class FileServiceImpl implements FileService {
                 userId, userFile.getId(), filename, realFile.getFileSize(), reused);
 
         return FileUploadVO.of(userFile, realFile, reused);
+    }
+
+    /**
+     * 分页查询当前用户的文件列表。
+     * <p>
+     * 用两次查询而不是写 join：
+     * ① 不需要新增 mapper XML 或 @Select 自定义 SQL，插件分页直接就能用；
+     * ② 一页最多 100 条，第二次是一次 IN (100 个主键) 的查询，成本可忽略；
+     * 代价是两次查询之间如果有人删了 real_file，第二次会取不到（本项目没有删除物理文件的入口，
+     * 代码里也做了防御，取不到就给 0 而不是让整个列表报 500）。
+     */
+    @Override
+    public PageVO<FileItemVO> listMine(long pageNum, long pageSize) {
+        Long userId = UserContext.getUserId();
+        if (userId == null) {
+            throw new BusinessException(401, "未登录");
+        }
+
+        // 夹紧分页参数。pageSize 不夹紧的话，前端传个 100000 就能把整张表拉出来，
+        // 这是个很常见的低级漏洞（接口防刷的基本功）。
+        long safePageNum = Math.max(pageNum, 1L);
+        long safePageSize = Math.min(Math.max(pageSize, 1L), MAX_PAGE_SIZE);
+
+        Page<UserFile> page = new Page<>(safePageNum, safePageSize);
+
+        // user_id 是查询条件的一部分，而不是"查出来再过滤"：
+        // 越权这道防线必须在 SQL 层面就堵死，前端传什么 userId 都进不来
+        LambdaQueryWrapper<UserFile> wrapper = new LambdaQueryWrapper<UserFile>()
+                .eq(UserFile::getUserId, userId)
+                .eq(UserFile::getParentId, 0L)   // Day5 只有根目录，目录结构是后续的事
+                .eq(UserFile::getIsDelete, 0)    // 回收站里的记录不出现
+                .orderByDesc(UserFile::getCreateTime)
+                // 按时间排序一定要带上 id 兜底：同一秒上传的多个文件 create_time 完全相同，
+                // MySQL 对"排序值相同的行"顺序不保证稳定，翻页时会出现同一行重复出现或漏掉
+                .orderByDesc(UserFile::getId);
+        userFileMapper.selectPage(page, wrapper);
+
+        List<UserFile> records = page.getRecords();
+
+        // 空集合不能直接丢给 selectByIds：那会拼出 "where id in ()" 这种语法错误的 SQL。
+        // 列表本来就空的时候直接返回，连库都不用查
+        List<Long> realFileIds = records.stream()
+                .map(UserFile::getRealFileId)
+                .distinct()
+                .toList();
+        Map<Long, RealFile> realFileMap = realFileIds.isEmpty()
+                ? Map.of()
+                : realFileMapper.selectByIds(realFileIds).stream()
+                        .collect(Collectors.toMap(RealFile::getId, Function.identity()));
+
+        return PageVO.of(page, userFile -> {
+            RealFile realFile = realFileMap.get(userFile.getRealFileId());
+            FileItemVO vo = new FileItemVO();
+            vo.setId(userFile.getId());
+            vo.setFilename(userFile.getFilename());
+            vo.setFileSize(realFile == null ? 0L : realFile.getFileSize());
+            vo.setCreateTime(userFile.getCreateTime());
+            return vo;
+        });
+    }
+
+    @Override
+    public UploadConfigVO getUploadConfig() {
+        UploadConfigVO vo = new UploadConfigVO();
+        vo.setMaxFileSize(maxFileSize.toBytes());
+        return vo;
     }
 
     /**
