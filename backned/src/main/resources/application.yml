@@ -27,3 +27,11 @@ jwt:
   secret: netDisk2026PersonalCloudStorageProjectSecretKeyLijunxian
   # token 过期时间，单位毫秒，7 天 = 7 * 24 * 60 * 60 * 1000
   expire: 604800000
+
+# 文件存储配置（新增）
+net-disk:
+  storage:
+    # 文件实际落盘的根目录。故意用绝对路径，避免"相对路径到底相对于谁"的困惑
+    # （相对路径在 IDE 里跑和打成 jar 跑，基准目录是不一样的，最容易踩坑）
+    # 想换存储位置只改这一行，代码里没有硬编码
+    root-path: D:/net-disk-storage

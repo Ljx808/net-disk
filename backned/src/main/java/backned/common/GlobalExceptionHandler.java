@@ -1,9 +1,11 @@
 package backned.common;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
 
 import java.util.stream.Collectors;
 
@@ -36,6 +38,22 @@ public class GlobalExceptionHandler {
                 .collect(Collectors.joining("；"));
         log.warn("参数校验失败: {}", message);
         return Result.error(400, message);
+    }
+
+    /**
+     * 上传文件超过大小限制。
+     * 不单独处理的话会掉进下面的兜底分支，返回"系统繁忙"，用户完全不知道是文件太大。
+     * <p>
+     * 提示里的限制值直接从配置读，不写死字符串 ——
+     * 否则改了 application.yml 的 max-file-size 却忘了改这里的文案，提示就是错的。
+     */
+    @Value("${spring.servlet.multipart.max-file-size}")
+    private String maxFileSize;
+
+    @ExceptionHandler(MaxUploadSizeExceededException.class)
+    public Result<Void> handleMaxUploadSize(MaxUploadSizeExceededException e) {
+        log.warn("上传文件超过大小限制: {}", e.getMessage());
+        return Result.error(400, "文件太大，单个文件最大 " + maxFileSize);
     }
 
     /** 兜底：前面都没接住的异常，对外只暴露一句通用提示，细节写日志，避免把堆栈泄露给前端 */
