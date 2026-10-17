@@ -44,7 +44,7 @@ public class ReconcileServiceImpl implements ReconcileService {
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneId.systemDefault());
 
     private static final String REF_COUNT_NOTE =
-            "口径：is_delete=1 的回收站行也计为引用（物理文件必须保留）；Day 8 设计删除时正式定义";
+            "口径：is_delete=1 的回收站行也计为引用（物理文件必须保留）；该口径已于 Day 8 定案";
 
     private static final String CAVEAT =
             "扫描与上传并发时，刚落盘、尚未插入 real_file 的文件会短暂出现在孤儿列表；"

@@ -17,8 +17,8 @@ public interface UserFileMapper extends BaseMapper<UserFile> {
      * <p>
      * <b>口径</b>：不过滤 is_delete —— 回收站里的行（is_delete=1）也算引用，
      * 因为它的物理文件必须还在，用户随时可能恢复。
-     * Day 8 做删除功能时会正式定义这个语义（届时若改为"回收站不算引用"，
-     * 这里和 ref_count 的维护逻辑要同步改）。
+     * 该语义已于 Day 8 定案并写入 CLAUDE.md：软删除/恢复不动 ref_count，
+     * 只有彻底删除 user_file 行时才递减，所以这里"数全部行"与 ref_count 始终可比。
      * <p>
      * 返回 Map 而不是实体：这是一次聚合查询，没有对应的表实体；
      * 两个 key 分别是 realFileId 和 cnt（SQL 里起的别名）。

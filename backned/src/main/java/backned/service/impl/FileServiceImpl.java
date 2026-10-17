@@ -12,6 +12,7 @@ import backned.vo.DownloadFileVO;
 import backned.vo.FileItemVO;
 import backned.vo.FileUploadVO;
 import backned.vo.PageVO;
+import backned.vo.RecycleItemVO;
 import backned.vo.UploadConfigVO;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
@@ -22,6 +23,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.DigestUtils;
 import org.springframework.util.unit.DataSize;
 import org.springframework.web.multipart.MultipartFile;
@@ -69,10 +71,7 @@ public class FileServiceImpl implements FileService {
     public FileUploadVO upload(MultipartFile file) {
         // 1. 用户身份只认 ThreadLocal 里拦截器解析出来的值。
         //    接口签名里没有 userId 参数，前端就算多传一个 userId 也进不来，从根上避免了越权上传。
-        Long userId = UserContext.getUserId();
-        if (userId == null) {
-            throw new BusinessException(401, "未登录");
-        }
+        Long userId = requireUserId();
 
         if (file == null || file.isEmpty()) {
             // 400 而不是默认的 500：这是调用方传错了，不是服务端故障
@@ -140,10 +139,7 @@ public class FileServiceImpl implements FileService {
      */
     @Override
     public PageVO<FileItemVO> listMine(long pageNum, long pageSize) {
-        Long userId = UserContext.getUserId();
-        if (userId == null) {
-            throw new BusinessException(401, "未登录");
-        }
+        Long userId = requireUserId();
 
         // 夹紧分页参数。pageSize 不夹紧的话，前端传个 100000 就能把整张表拉出来，
         // 这是个很常见的低级漏洞（接口防刷的基本功）。
@@ -164,18 +160,7 @@ public class FileServiceImpl implements FileService {
                 .orderByDesc(UserFile::getId);
         userFileMapper.selectPage(page, wrapper);
 
-        List<UserFile> records = page.getRecords();
-
-        // 空集合不能直接丢给 selectByIds：那会拼出 "where id in ()" 这种语法错误的 SQL。
-        // 列表本来就空的时候直接返回，连库都不用查
-        List<Long> realFileIds = records.stream()
-                .map(UserFile::getRealFileId)
-                .distinct()
-                .toList();
-        Map<Long, RealFile> realFileMap = realFileIds.isEmpty()
-                ? Map.of()
-                : realFileMapper.selectByIds(realFileIds).stream()
-                        .collect(Collectors.toMap(RealFile::getId, Function.identity()));
+        Map<Long, RealFile> realFileMap = loadRealFileMap(page.getRecords());
 
         return PageVO.of(page, userFile -> {
             RealFile realFile = realFileMap.get(userFile.getRealFileId());
@@ -186,6 +171,150 @@ public class FileServiceImpl implements FileService {
             vo.setCreateTime(userFile.getCreateTime());
             return vo;
         });
+    }
+
+    /**
+     * 回收站列表。
+     * <p>
+     * 与文件列表的隔离只有一处：这里查 is_delete=1，文件列表查 is_delete=0。
+     * 两条 SQL 都带 user_id，跨用户的行在任何一条里都读不到。
+     */
+    @Override
+    public PageVO<RecycleItemVO> listRecycle(long pageNum, long pageSize) {
+        Long userId = requireUserId();
+
+        long safePageNum = Math.max(pageNum, 1L);
+        long safePageSize = Math.min(Math.max(pageSize, 1L), MAX_PAGE_SIZE);
+        Page<UserFile> page = new Page<>(safePageNum, safePageSize);
+
+        // 故意不加 parent_id 条件：回收站是用户维度的，将来有目录后也不该只显示根目录的删除项。
+        // 索引代价：idx_user_parent(user_id, parent_id, is_delete) 只能用到最左列 user_id，
+        // is_delete 在第三列、跳过 parent_id 无法作为索引查找条件；当前数据量无感，已记入技术债观察。
+        userFileMapper.selectPage(page, new LambdaQueryWrapper<UserFile>()
+                .eq(UserFile::getUserId, userId)
+                .eq(UserFile::getIsDelete, 1)
+                // update_time 在软删除那一刻被 ON UPDATE CURRENT_TIMESTAMP 刷新，等价于"删除时间"；
+                // 同样带 id 兜底，保证同一秒删除的多条记录翻页顺序稳定
+                .orderByDesc(UserFile::getUpdateTime)
+                .orderByDesc(UserFile::getId));
+
+        Map<Long, RealFile> realFileMap = loadRealFileMap(page.getRecords());
+
+        return PageVO.of(page, userFile -> {
+            RealFile realFile = realFileMap.get(userFile.getRealFileId());
+            RecycleItemVO vo = new RecycleItemVO();
+            vo.setId(userFile.getId());
+            vo.setFilename(userFile.getFilename());
+            // real_file 理论上一定在；真被改坏了也给 0，不让整个回收站列表报 500
+            vo.setFileSize(realFile == null ? 0L : realFile.getFileSize());
+            vo.setDeleteTime(userFile.getUpdateTime());
+            return vo;
+        });
+    }
+
+    /**
+     * 软删除。
+     * <p>
+     * 三件事严格不做：不删 user_file 行、不动 real_file.ref_count、不删磁盘文件。
+     * 回收站里的记录仍然是一条完整的引用，物理文件必须留在原地，否则"恢复"就会恢复出
+     * 一条下载 404 的死记录。这个语义已写入 CLAUDE.md。
+     */
+    @Override
+    public boolean softDelete(Long userFileId) {
+        Long userId = requireUserId();
+
+        // 先按 id + user_id 查，故意不加 is_delete 条件：
+        // 需要区分"自己的、已在回收站"（幂等成功）和"不存在 / 不是自己的"（404）。
+        // user_id 写进 WHERE，越权在 SQL 层就堵死。
+        UserFile userFile = userFileMapper.selectOne(new LambdaQueryWrapper<UserFile>()
+                .eq(UserFile::getId, userFileId)
+                .eq(UserFile::getUserId, userId));
+        if (userFile == null) {
+            // 不存在 / 别人的，统一 40401 + 统一文案，不给 403，防 id 枚举
+            throw new BusinessException(40401, "文件不存在或无权访问");
+        }
+        if (Integer.valueOf(1).equals(userFile.getIsDelete())) {
+            return false; // 幂等：本来就在回收站
+        }
+
+        // 条件里带 is_delete=0，防并发重复删除。
+        // 不显式 set update_time，让 MySQL 的 ON UPDATE CURRENT_TIMESTAMP 把它刷成删除时间。
+        int updated = userFileMapper.update(null, new LambdaUpdateWrapper<UserFile>()
+                .eq(UserFile::getId, userFileId)
+                .eq(UserFile::getUserId, userId)
+                .eq(UserFile::getIsDelete, 0)
+                .set(UserFile::getIsDelete, 1));
+        if (updated == 0) {
+            // 并发窗口里别的请求先删了：重读一次，仍然只按归属说话
+            UserFile latest = userFileMapper.selectById(userFileId);
+            if (latest == null || !userId.equals(latest.getUserId())) {
+                throw new BusinessException(40401, "文件不存在或无权访问");
+            }
+            return false;
+        }
+
+        log.info("文件移入回收站 userId={}, userFileId={}, filename={}",
+                userId, userFileId, userFile.getFilename());
+        return true;
+    }
+
+    /**
+     * 从回收站恢复。
+     * <p>
+     * 用事务把"冲突检查 + 状态更新"包在一起：两步之间若失败，不能留下"检查过了但没更新"的中间态。
+     * 注意库里没有 (user_id, parent_id, filename) 唯一索引，事务也挡不住并发插入造成的极小窗口，
+     * 彻底解决需要加唯一索引，属于要 ALTER 的独立改动，本轮不做。
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public boolean restore(Long userFileId) {
+        Long userId = requireUserId();
+
+        UserFile userFile = userFileMapper.selectOne(new LambdaQueryWrapper<UserFile>()
+                .eq(UserFile::getId, userFileId)
+                .eq(UserFile::getUserId, userId));
+        if (userFile == null) {
+            throw new BusinessException(40401, "文件不存在或无权访问");
+        }
+        if (Integer.valueOf(0).equals(userFile.getIsDelete())) {
+            return false; // 幂等：本来就在文件列表里
+        }
+
+        // 同 user、同目录、同名、未删除、且不是自己 → 冲突。
+        // filename 列是 utf8mb4_unicode_ci，等值比较大小写不敏感，与数据库的语义保持一致。
+        Long conflict = userFileMapper.selectCount(new LambdaQueryWrapper<UserFile>()
+                .eq(UserFile::getUserId, userId)
+                .eq(UserFile::getParentId, userFile.getParentId())
+                .eq(UserFile::getFilename, userFile.getFilename())
+                .eq(UserFile::getIsDelete, 0)
+                .ne(UserFile::getId, userFile.getId()));
+        if (conflict != null && conflict > 0) {
+            // 不做自动改名：改名功能还没建，自动加 "(1)" 会让用户看到一条意料之外的文件名。
+            // 40901 → 真正的 HTTP 409（GlobalExceptionHandler 的 409xx 区间映射）
+            throw new BusinessException(40901,
+                    "同目录下已存在同名文件「" + userFile.getFilename() + "」，请先重命名或删除后再恢复");
+        }
+
+        int updated = userFileMapper.update(null, new LambdaUpdateWrapper<UserFile>()
+                .eq(UserFile::getId, userFile.getId())
+                .eq(UserFile::getUserId, userId)
+                .eq(UserFile::getIsDelete, 1)
+                .set(UserFile::getIsDelete, 0));
+        if (updated == 0) {
+            // 并发：可能已被另一个请求恢复。重读后按当前状态回答，结果一致就当成功
+            UserFile latest = userFileMapper.selectById(userFile.getId());
+            if (latest == null || !userId.equals(latest.getUserId())) {
+                throw new BusinessException(40401, "文件不存在或无权访问");
+            }
+            if (Integer.valueOf(0).equals(latest.getIsDelete())) {
+                return false;
+            }
+            throw new BusinessException("恢复失败，请稍后重试");
+        }
+
+        log.info("从回收站恢复 userId={}, userFileId={}, filename={}",
+                userId, userFile.getId(), userFile.getFilename());
+        return true;
     }
 
     @Override
@@ -203,10 +332,7 @@ public class FileServiceImpl implements FileService {
      */
     @Override
     public DownloadFileVO download(Long userFileId) {
-        Long userId = UserContext.getUserId();
-        if (userId == null) {
-            throw new BusinessException(401, "未登录");
-        }
+        Long userId = requireUserId();
 
         // 归属校验：user_id 和 is_delete 都写进 WHERE。
         // "记录不存在"、"是别人的"、"已进回收站"三种情况在 SQL 层面就是同一个结果 —— 查不到，
@@ -249,6 +375,37 @@ public class FileServiceImpl implements FileService {
         vo.setMimeType(realFile.getMimeType());
         vo.setResource(resource);
         return vo;
+    }
+
+    /**
+     * 取当前登录用户；取不到说明 JWT 拦截器没把身份放进 ThreadLocal。
+     * <p>
+     * 拦截器正常工作时这个分支不会走到，保留它是纵深防御：
+     * 万一将来某个接口被加进放行名单，也不会以 userId=null 去查库。
+     */
+    private Long requireUserId() {
+        Long userId = UserContext.getUserId();
+        if (userId == null) {
+            throw new BusinessException(401, "未登录");
+        }
+        return userId;
+    }
+
+    /**
+     * 一次批量取回本页涉及的 real_file，避免 N+1 查询。
+     * <p>
+     * 文件列表和回收站共用。空集合不能直接丢给 selectByIds：
+     * 那会拼出 {@code where id in ()} 这种语法错误的 SQL。
+     */
+    private Map<Long, RealFile> loadRealFileMap(List<UserFile> records) {
+        List<Long> realFileIds = records.stream()
+                .map(UserFile::getRealFileId)
+                .distinct()
+                .toList();
+        return realFileIds.isEmpty()
+                ? Map.of()
+                : realFileMapper.selectByIds(realFileIds).stream()
+                        .collect(Collectors.toMap(RealFile::getId, Function.identity()));
     }
 
     /**

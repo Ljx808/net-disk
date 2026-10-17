@@ -4,6 +4,7 @@ import backned.vo.DownloadFileVO;
 import backned.vo.FileItemVO;
 import backned.vo.FileUploadVO;
 import backned.vo.PageVO;
+import backned.vo.RecycleItemVO;
 import backned.vo.UploadConfigVO;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -20,6 +21,35 @@ public interface FileService {
      * @param pageSize 每页条数，非法值由实现类夹紧
      */
     PageVO<FileItemVO> listMine(long pageNum, long pageSize);
+
+    /**
+     * 分页查询当前登录用户的回收站（{@code is_delete=1} 的记录）。
+     * <p>
+     * 不加 parent_id 条件：回收站是用户维度的，将来有目录后也不该只显示根目录的删除项。
+     * 分页参数口径与 {@link #listMine} 完全一致。
+     */
+    PageVO<RecycleItemVO> listRecycle(long pageNum, long pageSize);
+
+    /**
+     * 软删除：把文件移入回收站。
+     * <p>
+     * 只改 {@code user_file.is_delete}，<b>不动</b> {@code real_file}、{@code ref_count} 和磁盘文件。
+     *
+     * @return true=本次真的移入；false=本来就在回收站（幂等）
+     * @throws backned.common.BusinessException 40401 文件不存在或无权访问
+     */
+    boolean softDelete(Long userFileId);
+
+    /**
+     * 从回收站恢复文件。
+     * <p>
+     * 同样只改 {@code is_delete}，不碰物理文件。恢复前检查同目录有无同名未删除文件，
+     * 有冲突时不自动改名，直接报错交给用户处理。
+     *
+     * @return true=本次真的恢复；false=本来就在列表里（幂等）
+     * @throws backned.common.BusinessException 40401 文件不存在或无权访问；40901 同目录同名冲突
+     */
+    boolean restore(Long userFileId);
 
     /** 上传相关配置。前端启动时拿它显示"单文件最大 xxx"，避免把限制写死在页面上 */
     UploadConfigVO getUploadConfig();

@@ -6,6 +6,7 @@ import backned.vo.DownloadFileVO;
 import backned.vo.FileItemVO;
 import backned.vo.FileUploadVO;
 import backned.vo.PageVO;
+import backned.vo.RecycleItemVO;
 import backned.vo.UploadConfigVO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -15,9 +16,11 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.InvalidMediaTypeException;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -65,6 +68,47 @@ public class FileController {
             @RequestParam(defaultValue = "1") long pageNum,
             @RequestParam(defaultValue = "10") long pageSize) {
         return Result.success(fileService.listMine(pageNum, pageSize));
+    }
+
+    /**
+     * 回收站列表。
+     * <p>
+     * 路径是 {@code /recycle} 而不是 {@code /recycle/list}：它本身就是"回收站"这个集合资源，
+     * 分页参数和 {@code /list} 同口径。GET 语义与文件列表一致，能直接在地址栏调试。
+     */
+    @GetMapping("/recycle")
+    public Result<PageVO<RecycleItemVO>> recycle(
+            @RequestParam(defaultValue = "1") long pageNum,
+            @RequestParam(defaultValue = "10") long pageSize) {
+        return Result.success(fileService.listRecycle(pageNum, pageSize));
+    }
+
+    /**
+     * 软删除：移入回收站。
+     * <p>
+     * 用 DELETE 而不是 {@code POST /delete}：删除是 DELETE 的标准语义，且它应当幂等 ——
+     * 客户端超时重试第二次删除，返回 200 + "文件已在回收站"，而不是一个错误。
+     * <p>
+     * 不存在 / 不是自己的，统一 HTTP 404 + 40401，不区分，防 id 枚举。
+     */
+    @DeleteMapping("/{userFileId}")
+    public Result<Void> delete(@PathVariable Long userFileId) {
+        boolean changed = fileService.softDelete(userFileId);
+        return Result.success(changed ? "已移入回收站" : "文件已在回收站", null);
+    }
+
+    /**
+     * 从回收站恢复。
+     * <p>
+     * 用 PUT：它表达"把资源状态置回 active"，重复调用收敛到同一状态；
+     * 状态本来就是 active 时返回 200 + 提示，而不是报错。
+     * <p>
+     * 同目录已有同名文件时返回 HTTP 409 + 40901，不做自动改名。
+     */
+    @PutMapping("/{userFileId}/restore")
+    public Result<Void> restore(@PathVariable Long userFileId) {
+        boolean changed = fileService.restore(userFileId);
+        return Result.success(changed ? "已恢复" : "文件已在列表中，无需恢复", null);
     }
 
     /**

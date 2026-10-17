@@ -40,7 +40,8 @@ import java.util.stream.Collectors;
  * <b>编码规则（两条线，别混）</b>：
  * <ul>
  *   <li>业务异常 {@link BusinessException}：带自己的细粒度业务码（401、40401、40402…），
- *       其中 404xx 映射成真正的 HTTP 404，其余维持 HTTP 200（历史行为，见 {@link #toHttpStatus}）。</li>
+ *       其中 404xx 映射成真正的 HTTP 404、409xx 映射成真正的 HTTP 409，
+ *       其余维持 HTTP 200（历史行为，见 {@link #toHttpStatus}）。</li>
  *   <li>框架异常：HTTP 状态码是它自己的语义（400/404/405/415/500），业务码统一取
  *       {@code HTTP 状态码 × 100}（404 → 40400、400 → 40000），前端看 code 的前三位
  *       就知道对应的 HTTP 语义，不用再一张张记编号。</li>
@@ -66,6 +67,10 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     private static final int NOT_FOUND_CODE_START = 40400;
     private static final int NOT_FOUND_CODE_END = 40500;
 
+    /** 业务码 409xx 的区间：资源状态冲突（如恢复时同目录已有同名文件），映射成真正的 HTTP 409 */
+    private static final int CONFLICT_CODE_START = 40900;
+    private static final int CONFLICT_CODE_END = 41000;
+
     /** 上传上限的原始文案（如 100MB），从 application.yml 读，不写死 */
     @Value("${spring.servlet.multipart.max-file-size}")
     private String maxFileSize;
@@ -90,14 +95,25 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     /**
      * 业务码 → HTTP 状态码。
      * <p>
-     * 只映射 404xx，其余一律维持 HTTP 200 —— 这是有意的保守做法，不是在偷懒：
-     * 401/400 目前的表现是 HTTP 200 + body 里的 code，前端拦截器就是按这个行为写的
-     * （比如 401 会触发跳登录页），那些接口 Day4/Day5 已经验收过了。
+     * 目前映射两个区间：404xx → 404、409xx → 409；其余一律维持 HTTP 200。
+     * 维持 HTTP 200 是有意的保守做法，不是在偷懒：401/400 目前的表现是
+     * HTTP 200 + body 里的 code，前端拦截器就是按这个行为写的（比如 401 会触发跳登录页），
+     * 那些接口 Day4/Day5 已经验收过了。
      * 代价是"HTTP 状态码和业务码不完全一致"，已记入 CLAUDE.md 的已知技术债。
+     * <p>
+     * 409xx 是 Day8 新增的区间：恢复文件时同目录已有同名文件属于"请求与当前资源状态冲突"，
+     * 用 409 比 400（请求本身格式有错）更准确。区间映射沿用 404xx 的写法，
+     * 以后新增业务码只要落进区间就自动拿到正确状态码，不用再改这里。
      */
     private HttpStatus toHttpStatus(Integer code) {
-        if (code != null && code >= NOT_FOUND_CODE_START && code < NOT_FOUND_CODE_END) {
+        if (code == null) {
+            return HttpStatus.OK;
+        }
+        if (code >= NOT_FOUND_CODE_START && code < NOT_FOUND_CODE_END) {
             return HttpStatus.NOT_FOUND;
+        }
+        if (code >= CONFLICT_CODE_START && code < CONFLICT_CODE_END) {
+            return HttpStatus.CONFLICT;
         }
         return HttpStatus.OK;
     }
