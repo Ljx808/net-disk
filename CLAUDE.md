@@ -32,7 +32,7 @@
   - Day 6 文件下载（`GET /api/file/download/{userFileId}` 归属校验 + 流式返回、`Content-Disposition` 中文名 RFC 6266 编码、前端 axios+Blob 下载）
     - 联调补丁一：全局异常处理补上 404/405/415/请求体解析四类框架异常，修掉"URL 打错却显示系统繁忙"的假 500（起因见下方"踩坑记录"）
     - 联调补丁二（2026-10-17）：`GlobalExceptionHandler` 改为**继承 `ResponseEntityExceptionHandler` + 覆写 `handleExceptionInternal`**，整族框架异常收编进统一出口，不再逐个枚举（枚举法天然会漏，`MissingServletRequestPartException` 就是漏掉的那个）。随之批准三处状态码变更，见"已知技术债"里的状态码条目
-- 当前状态：**Day 6 已收工**（下载 → 异常补丁 → 异常处理重构，三笔已提交 `739625c`/`fb9a2b0`/`ff470dc`；`docs/schema.sql` 空库自举已修复并冒烟通过，待提交），下一步 Day 7 做对账/巡检任务
+- 当前状态：**Day 6 已收工**（下载 → 异常补丁 → 异常处理重构，三笔已提交 `739625c`/`fb9a2b0`/`ff470dc`；`docs/schema.sql` 空库自举已修复并冒烟通过，已提交 `870c09a`），下一步 Day 7 做对账/巡检任务
 - 已定路线（顺序不要随意调整）：**Day 6 下载（已完成）→ Day 7 对账/巡检任务 → Day 8 删除/回收站**
   - 对账任务排在删除之前的原因：删除功能一上线，回收站、物理删除、`ref_count` 归零这几个动作会立刻让孤儿文件的成因复杂化，先对账更容易定位
   - **Day 6 范围**（已完成）：按 `user_file` id 下载；校验该记录归属当前登录用户（越权防线）；按 `file_path` + `mime_type` 流式返回（不能整个读进内存）
