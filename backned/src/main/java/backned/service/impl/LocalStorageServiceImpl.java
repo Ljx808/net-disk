@@ -11,13 +11,16 @@ import org.springframework.stereotype.Service;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
+import java.util.List;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 /**
  * 本地磁盘存储实现。
@@ -91,6 +94,47 @@ public class LocalStorageServiceImpl implements StorageService {
         // ResourceHttpMessageConverter 里，它用 8KB 缓冲区循环 write 到响应流，
         // 所以文件多大都不会整个进堆内存。
         return new FileSystemResource(path);
+    }
+
+    /**
+     * 列出存储根目录下的全部文件，供对账巡检使用。
+     * <p>
+     * 三个实现细节：
+     * <ul>
+     *   <li>{@code Files.walk} 必须放在 try-with-resources 里：它返回的 Stream 持有目录句柄，
+     *       不关闭会泄漏文件句柄（Windows 上表现为目录删不掉）。</li>
+     *   <li>只保留普通文件（{@code isRegularFile}）：空目录不该被当成"神秘文件"对出来。</li>
+     *   <li>相对路径要把反斜杠换成正斜杠：Windows 上 {@code relativize} 给的是
+     *       {@code 2026\10\16\xxx}，而库里存的是 {@code 2026/10/16/xxx}，
+     *       不统一就一个都对不上，整片磁盘会全被报成孤儿。</li>
+     * </ul>
+     * 默认不跟随符号链接，避免软链把目录扫成环。
+     */
+    @Override
+    public List<StoredFile> listAll() {
+        try (Stream<Path> stream = Files.walk(rootDir)) {
+            return stream
+                    .filter(Files::isRegularFile)
+                    .map(this::toStoredFile)
+                    .toList();
+        } catch (IOException | UncheckedIOException e) {
+            // 扫描失败属于环境问题（根目录不可读），不是业务错误；但对接口来说仍是失败，
+            // 交给全局异常处理变成 500，日志里保留完整堆栈。
+            log.error("存储目录扫描失败: {}", rootDir, e);
+            throw new BusinessException("存储目录扫描失败，请检查存储根目录是否可读");
+        }
+    }
+
+    /** 读一个文件的元信息；IOException 转成非受检异常，方便在 stream 里用 */
+    private StoredFile toStoredFile(Path path) {
+        try {
+            return new StoredFile(
+                    rootDir.relativize(path).toString().replace('\\', '/'),
+                    Files.size(path),
+                    Files.getLastModifiedTime(path).toInstant());
+        } catch (IOException e) {
+            throw new UncheckedIOException("读取文件元信息失败: " + path, e);
+        }
     }
 
     /**

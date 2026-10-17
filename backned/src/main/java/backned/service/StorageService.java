@@ -3,6 +3,8 @@ package backned.service;
 import org.springframework.core.io.Resource;
 
 import java.io.InputStream;
+import java.time.Instant;
+import java.util.List;
 
 /**
  * 存储抽象层。
@@ -57,4 +59,31 @@ public interface StorageService {
      * @param relativePath save() 返回的那个相对路径
      */
     Resource load(String relativePath);
+
+    /**
+     * 列出存储根目录下的全部文件（对账巡检用）。
+     * <p>
+     * 为什么放在存储抽象里，而不是在 Service 里直接读 {@code root-path}：
+     * "能枚举自己存了哪些文件"本来就是存储层的职责。将来换成 OSS，
+     * 只需用 listObjects 实现这个方法，对账业务代码一行都不用改。
+     * <p>
+     * 只读：只取路径、大小、最后修改时间，不读文件内容。
+     *
+     * @return 全部文件的元信息；相对路径统一用正斜杠（如 2026/10/16/ab12cd34…），
+     *         与 real_file.file_path 同口径，便于直接比对
+     */
+    List<StoredFile> listAll();
+
+    /**
+     * 存储中的一个文件。
+     * <p>
+     * 用 record 而不是普通类：这是只进不出的值对象，没有 setter 也不需要继承，
+     * 写一行就能表达清楚（Java 16+ 的特性，项目是 Java 17）。
+     *
+     * @param relativePath 相对存储根目录的路径，正斜杠分隔
+     * @param sizeBytes    文件大小（字节）
+     * @param lastModified 最后修改时间，用来算"年龄"，也是清理前的保护条件
+     */
+    record StoredFile(String relativePath, long sizeBytes, Instant lastModified) {
+    }
 }
