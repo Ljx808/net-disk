@@ -34,14 +34,30 @@
     - 联调补丁二（2026-10-17）：`GlobalExceptionHandler` 改为**继承 `ResponseEntityExceptionHandler` + 覆写 `handleExceptionInternal`**，整族框架异常收编进统一出口，不再逐个枚举（枚举法天然会漏，`MissingServletRequestPartException` 就是漏掉的那个）。随之批准三处状态码变更，见"已知技术债"里的状态码条目
   - Day 7 对账巡检（`GET /api/admin/reconcile`，**纯只读**）：盘有库无（孤儿候选：相对路径/大小/落盘时间/年龄）、库有盘无（失踪：real_file.id + file_path）、ref_count 审计（库值 vs user_file 实际行数，含 `is_delete=1`）三段报告；比对键 = 相对路径（正斜杠，与 `real_file.file_path` 同口径）；只报告不修复
     - Day 7 拉伸目标：手动清理（`POST /api/admin/reconcile/cleanup`）——白名单**实时重算** + 无 `user_file` 引用（含回收站行）+ 落盘 ≥24h 三道闸，逐条返回 deleted/skipped 及原因；2026-10-18 真实档 **4/4** 清理完成
-- 当前状态：**Day 7 已收工**（只读巡检 `1d89c43` + 手动清理本笔；真实档 4/4 清理完成，复跑巡检三段全零、磁盘 7→3、库侧 `2/3/4` 不变），下一步 Day 8 删除/回收站
-- 已定路线（顺序不要随意调整）：**Day 6 下载（已完成）→ Day 7 对账/巡检任务 → Day 8 删除/回收站**
+  - Day 8 删除/回收站（正餐，2026-10-18）：
+    - 软删除 `DELETE /api/file/{userFileId}`、恢复 `PUT /api/file/{userFileId}/restore`、回收站列表 `GET /api/file/recycle`（分页口径同文件列表，`pageSize` 夹紧 1~100）
+    - `ref_count` 语义定案（见下方专节）：**含回收站行**；软删除/恢复只改 `is_delete`，不动 `ref_count`、不动磁盘；只有彻底删除才递减
+    - 越权统一 **HTTP 404 + 40401**（不给 403，防 id 枚举）；重复删除/重复恢复 **HTTP 200 幂等**；恢复时同目录同名冲突 **HTTP 409 + 40901**，不自动改名
+    - 2026-10-18 验收：临时档 59 项断言通过（16 项功能/冲突/越权/分页 + E1~E13 + 留 1 个回收站文件后巡检三段全零）；真实档只读通过，前后指纹 `2/3/4`、`sum_ref=4`、存储 `b8020321…` 完全一致
+    - 拉伸目标（本轮未做）：彻底删除 / 清空回收站（触发 `ref_count` 递减 + 物理文件清理），必须在正餐验收后单独立项
+- 当前状态：**Day 8 已收工**（软删除/回收站/恢复三接口 + 409 映射；临时档 59 项全过、真实档只读零污染），下一步目录结构（顺延项）
+- 已定路线（顺序不要随意调整）：**Day 6 下载（已完成）→ Day 7 对账/巡检任务（已完成）→ Day 8 删除/回收站（已完成）→ 目录结构（下一步）**
   - 对账任务排在删除之前的原因：删除功能一上线，回收站、物理删除、`ref_count` 归零这几个动作会立刻让孤儿文件的成因复杂化，先对账更容易定位
   - Day 7 范围确认（2026-10-18）：**只读对账巡检**为今日必做；**手动清理**是拉伸目标，必须在 Day 8 删除功能之前完成；`@Scheduled` 自动清理**不做**；目录结构顺延到 Day 8 之后
   - **孤儿清理 = 拉伸目标，状态：已完成（2026-10-18，真实档 4/4），时限满足（早于 Day 8）**
   - **Day 6 范围**（已完成）：按 `user_file` id 下载；校验该记录归属当前登录用户（越权防线）；按 `file_path` + `mime_type` 流式返回（不能整个读进内存）
   - **Day 6 明确不做**：分享链接、断点续传、在线预览、（实现时另定）批量下载、下载计数
-- 后续待办：分享、容量配额、分片上传、在线预览
+- 后续待办：目录结构、彻底删除/清空回收站（Day 8 拉伸目标）、分享、容量配额、分片上传、在线预览
+
+## ref_count 语义（Day 8 定案）
+
+`real_file.ref_count` = 指向该 `real_file` 的 `user_file` 行数，**包含回收站行（`is_delete=1`）**。
+
+- 软删除 / 恢复：只改 `user_file.is_delete`，**绝不动 `ref_count`**，也不动磁盘文件；
+- 只有**彻底删除**（物理 `DELETE user_file` 行）才 `ref_count - 1`；
+- 递减到 0：删 `real_file` 行 + 删物理文件；递减后仍 > 0：物理文件**必须保留**（秒传共享，不能因为一个用户删了就把别人的文件删掉）；
+- 巡检口径与之一致：`UserFileMapper.countByRealFileId()` 不过滤 `is_delete`，实际引用数与 `ref_count` 直接可比；
+- 为什么回收站行也算引用：恢复只改一个标志位，物理文件必须还在场，否则恢复出来的是一条下载 404 的死记录。
 
 ## 已知技术债
 - **文件列表分页的排序字段没有索引（Day 5 发现，未修）**
@@ -64,7 +80,7 @@
   - 影响：只占磁盘空间，不影响功能（没有任何接口会读到它们）。
   - 清理方案（挂账到"对账任务"）：扫描存储根目录得到磁盘文件集合，查 `real_file` 得到应存集合，取差集就是孤儿候选；删除前必须满足两个条件 —— ① 该文件确实没有任何记录引用，② 文件创建时间早于 N 天。第 ② 条不能省：`saveNewRealFile` 是"先落盘、再插库"，中间存在短暂的时间窗口，不讲时间条件的对账会误删正在上传中的文件。
   - 反向对账（同样属于这个任务）：`real_file` 有记录但磁盘文件不存在的情况（Day 4 已记录过这个风险），以及 `ref_count` 与实际引用它的 `user_file` 行数是否对得上。
-- **HTTP 状态码与业务码不完全一致（Day 6 引入 → 2026-10-17 框架异常部分已偿还）**
+- **HTTP 状态码与业务码不完全一致（Day 6 引入 → 2026-10-17 框架异常部分已偿还 → 2026-10-18 409xx 已映射）**
   - **已偿还（2026-10-17，重构 `GlobalExceptionHandler`）**：`GlobalExceptionHandler` 改为**继承 `ResponseEntityExceptionHandler` + 覆写 `handleExceptionInternal`**，由父类一次性接管整族框架异常（不再逐个枚举——枚举法天然会漏，`MissingServletRequestPartException` 就是漏掉的那个），所有分支都从 `handleExceptionInternal` 这一个出口包成 `Result` 信封。框架异常的 code 统一取 **`HTTP 状态码 × 100`**：
     | 场景 | HTTP | code |
     |---|---|---|
@@ -79,8 +95,16 @@
     ③ 业务码 **`40001`（请求体解析失败）、`40002`（multipart 格式错）废止**，统一并入 `40000`。粒度损失可接受——前端拦截器只看 `code` 是否为零，不依赖具体数值。
     批准理由：原"维持现状"是最小化热改动的权宜，不是对 HTTP 200 包裹的认可；真状态码让 nginx 日志和监控能看见错误。
   - **硬约束：所有响应（含上述每一个分支）必须保持 `Result` 信封（code/message/data）不变**，前端拦截器按信封解析的行为不受影响。
-  - **仍未偿还的部分**：业务异常 `BusinessException` 里，只有 `404xx` 映射成真 HTTP 404，其余业务码（401、400……）**仍然 HTTP 200 + body 里放 code**。这是有意的保守做法：改动会牵动 Day 2~Day 5 已验收的接口与前端拦截器。后续若统一，方向是把 `toHttpStatus` 从"只认 404xx"扩展成按区间/枚举映射，并同步前端拦截器。
+  - **仍未偿还的部分**：业务异常 `BusinessException` 里，`404xx` 映射成真 HTTP 404、`409xx` 映射成真 HTTP 409（2026-10-18 Day 8 新增，区间映射沿用 404xx 写法），其余业务码（401、400……）**仍然 HTTP 200 + body 里放 code**。这是有意的保守做法：改动会牵动 Day 2~Day 5 已验收的接口与前端拦截器。后续若统一，方向是把 401/400 等历史业务码也纳入区间映射，并同步前端拦截器。
   - **实现上的两个坑（实测踩到，别凭直觉改代码）**：① 父类那个 `final handleException` 上挂的是 **20 个具体类型**的 `@ExceptionHandler`，这些类型在本类里**不能再写 `@ExceptionHandler`**，否则**启动即抛** `IllegalStateException: Ambiguous @ExceptionHandler method mapped for [...]`——想改提示只能覆写同签名的 `protected` 钩子（`handleMaxUploadSizeExceededException` / `handleMethodArgumentNotValid` / `handleTypeMismatch`）。② **`Exception.class` 父类不管**，所以本类必须自己保留 `@ExceptionHandler(Exception.class)` 兜底，否则意外异常会绕过 advice 走 Spring Boot 默认 `/error`，响应结构就不再是 `Result` 信封了。
+- **回收站列表只命中索引最左列（Day 8 发现，未修）**
+  - 现象：`GET /api/file/recycle` 的 WHERE 是 `user_id=? AND is_delete=1`，`idx_user_parent(user_id, parent_id, is_delete)` 的最长等值前缀只有 `user_id`；`is_delete` 在第三列、跳过 `parent_id` 无法作为索引查找条件。执行计划是 `range(user_id)` + 过滤（5.7 的 ICP 可在索引层过滤），**不是全表扫描**，但会扫到该用户所有行（正常的 + 回收站的）；`ORDER BY update_time DESC` 仍需 filesort。
+  - 为什么查询不带 `parent_id`：回收站是用户维度的，将来有目录后也不该只显示根目录的删除项。
+  - 建议形态：`(user_id, is_delete, update_time)`；当前数据量无感，等数据量上来再改（改索引要 ALTER，不在 Day 8 范围）。
+- **`DELETE /api/file/{userFileId}` 会改变单段假路径的状态码（Day 8 引入，已知行为）**
+  - 现象：新增 `@DeleteMapping("/{userFileId}")` 后，`GET /api/file/zzz` 从 404/40400 变成 **405/40500**（Spring 先按路径找到 DELETE 映射，再报方法不支持）；`DELETE /api/file/list` 带 token 会走进 `/{userFileId}`，`list` 转 Long 失败 → **400/40000**（无 token 时仍是拦截器先返回 401）。
+  - 真正无映射的路径（如 `GET /api/file/zzz/zzz`）仍是 404/40400；异常处理分支本身没有回归。
+  - 影响：只影响"拿单段假路径当 404 用例"的测试；业务接口不受影响。以后复跑异常回归时，404 用例要用两段以上假路径，避免被 405 干扰。
 - **`docs/schema.sql` 建不出能跑的库（Day 6 发现 → 2026-10-17 已修）**
   - 现象（修复前）：`CREATE TABLE user (...)` 在文件末尾被注释掉了（标注"已有的 user 表结构，仅供对照，不要重复执行"），文件里实际只有 `real_file`、`user_file` 两张可执行的建表语句。但项目约定写明"三张表以 `docs/schema.sql` 为准"，两者对不上。
   - 影响（修复前）：拿这个文件在一台干净机器/空库上初始化，得到的库缺 `user` 表，注册和登录会直接报 `Table 'xxx.user' doesn't exist`。Day 6 起临时验证库时就踩到了，只能临时 `CREATE TABLE net_disk_verify.user LIKE net_disk.user` 兜住才把回归跑完。
