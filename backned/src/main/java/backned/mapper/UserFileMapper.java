@@ -3,6 +3,7 @@ package backned.mapper;
 import backned.entity.UserFile;
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
 import org.apache.ibatis.annotations.Mapper;
+import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
 
 import java.util.List;
@@ -24,4 +25,28 @@ public interface UserFileMapper extends BaseMapper<UserFile> {
      */
     @Select("SELECT real_file_id AS realFileId, COUNT(*) AS cnt FROM user_file GROUP BY real_file_id")
     List<Map<String, Object>> countByRealFileId();
+
+    /**
+     * 统计一批文件路径各自被多少条 user_file 引用（清理前的第二道闸）。
+     * <p>
+     * user_file 没有路径字段，路径挂在 real_file 上，所以要 JOIN 一次。
+     * 同样不过滤 is_delete：回收站里的行也算引用。
+     * <p>
+     * 一次查完而不是循环单查（避免 N+1）：清理请求通常只有几条路径，
+     * 但"批量接口不该按条查库"这个习惯要从一开始就养成。
+     *
+     * @param filePaths 待检查的相对路径（调用方保证非空）
+     * @return 每行 {filePath, cnt}，没有被引用的路径不会出现在结果里
+     */
+    @Select("""
+            <script>
+            SELECT rf.file_path AS filePath, COUNT(*) AS cnt
+            FROM user_file uf
+            JOIN real_file rf ON rf.id = uf.real_file_id
+            WHERE rf.file_path IN
+            <foreach collection="filePaths" item="p" open="(" separator="," close=")">#{p}</foreach>
+            GROUP BY rf.file_path
+            </script>
+            """)
+    List<Map<String, Object>> countReferencesByPaths(@Param("filePaths") List<String> filePaths);
 }
