@@ -23,6 +23,12 @@ const routes = [
     // requiresAuth 是自定义标记，下面守卫靠它判断这个页面要不要登录
     meta: { title: '我的网盘', requiresAuth: true },
   },
+  {
+    path: '/recycle',
+    name: 'Recycle',
+    component: () => import('@/views/Recycle.vue'),
+    meta: { title: '回收站', requiresAuth: true },
+  },
   // 兜底：用户手输乱七八糟的地址时不要白屏
   { path: '/:pathMatch(.*)*', redirect: '/home' },
 ]

@@ -62,19 +62,38 @@ request.interceptors.response.use(
     const status = error.response?.status
     const body = error.response?.data
     let message
+    let bizCode
 
     if (body instanceof Blob) {
       // 请求带了 responseType: 'blob' 时，连错误响应体也是 Blob（里面装的其实是 JSON 文本）。
       // 不解析的话 body.message 永远是 undefined，用户只能看到"请求失败(404)"，
       // 完全不知道是"文件不存在"还是"文件内容缺失"。
+      //
+      // 除了 message，还要把 code 取出来：下载场景里后端用 40003（下载文件夹）、
+      // 40903 等业务码表达具体语义，调用方需要按 code 判定，而不是只看 HTTP 状态。
+      // 注意这段解析只发生在非 2xx 分支：错误 JSON 根本不会流到 saveBlob，不会被存成文件。
       try {
-        message = JSON.parse(await body.text()).message
+        const parsed = JSON.parse(await body.text())
+        message = parsed.message
+        bizCode = parsed.code
       } catch (e) {
         // 响应体不是 JSON（比如网关吐的 HTML 错误页），解析失败就交给下面的兜底文案
       }
     } else {
       message = body?.message
+      bizCode = body?.code
     }
+
+    // 把业务码和文案挂到 error 上，页面可以按 code 做分支（如 40401 自动退回根目录）
+    if (bizCode != null) {
+      error.bizCode = bizCode
+    }
+    error.bizMessage = message
+
+    // silentError 只影响"提示由谁弹"，不影响 401 的安全处理：
+    // 需要精细控制提示的页面（目录列表、回收站）自己 catch 后弹一次，
+    // 避免这里弹了、页面又弹一条重复的
+    const silent = error.config?.silentError === true
 
     if (status === 401) {
       // token 缺失、伪造或过期：清掉本地 token 并回登录页
@@ -84,6 +103,8 @@ request.interceptors.response.use(
       if (router.currentRoute.value.path !== '/login') {
         router.push({ path: '/login', query: { redirect: router.currentRoute.value.fullPath } })
       }
+    } else if (silent) {
+      // 提示交给调用方：它拿得到 error.bizCode / error.bizMessage
     } else if (status) {
       ElMessage.error(message || `请求失败(${status})`)
     } else {
