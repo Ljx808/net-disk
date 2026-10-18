@@ -12,6 +12,8 @@ import backned.vo.DownloadFileVO;
 import backned.vo.FileItemVO;
 import backned.vo.FileUploadVO;
 import backned.vo.PageVO;
+import backned.vo.PurgeBatchVO;
+import backned.vo.PurgeItemVO;
 import backned.vo.RecycleItemVO;
 import backned.vo.UploadConfigVO;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
@@ -24,6 +26,7 @@ import org.springframework.core.io.Resource;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.util.DigestUtils;
 import org.springframework.util.unit.DataSize;
 import org.springframework.web.multipart.MultipartFile;
@@ -31,6 +34,7 @@ import org.springframework.web.multipart.MultipartFile;
 import java.io.IOException;
 import java.io.InputStream;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
@@ -50,6 +54,15 @@ public class FileServiceImpl implements FileService {
     private final RealFileMapper realFileMapper;
     private final UserFileMapper userFileMapper;
     private final StorageService storageService;
+
+    /**
+     * 编程式事务。
+     * <p>
+     * 彻底删除必须是"数据库提交成功 → 再删物理文件"，所以要把事务当成一段可以包起来的代码，
+     * 而不是给整个方法加 {@code @Transactional}（那样物理删除会发生在提交之前，回滚就造出"库有盘无"）。
+     * 另外，清空回收站要逐条调用单条逻辑，同类自调用走不到 Spring 的事务代理，{@code @Transactional} 会静默失效。
+     */
+    private final TransactionTemplate transactionTemplate;
 
     /**
      * 单文件大小上限，直接读 multipart 配置。
@@ -118,9 +131,19 @@ public class FileServiceImpl implements FileService {
         userFileMapper.insert(userFile);
 
         // 5. 引用计数 +1。用 SQL 自增而不是"先查出来再 set"，避免并发下算丢
-        realFileMapper.update(null, new LambdaUpdateWrapper<RealFile>()
+        int refUpdated = realFileMapper.update(null, new LambdaUpdateWrapper<RealFile>()
                 .setSql("ref_count = ref_count + 1")
                 .eq(RealFile::getId, realFile.getId()));
+        if (refUpdated == 0) {
+            // 极小概率的竞态：selectByMd5 拿到记录之后、这一步之前，最后一条引用被彻底删除，
+            // real_file 行连同物理文件一起没了。此时刚插入的 user_file 会变成一条指向不存在记录的死数据，
+            // 所以先把它删掉，再让用户重试（重试会重新落盘、重新建记录）。
+            // 这条更新影响行数以前是被忽略的，Day 9 加这条检查就是为了堵住"库有悬空引用"。
+            userFileMapper.deleteById(userFile.getId());
+            log.warn("上传竞争: real_file 已被彻底删除, 回滚刚插入的 user_file. realFileId={}, userFileId={}",
+                    realFile.getId(), userFile.getId());
+            throw new BusinessException(40901, "文件已被清理，请重新上传");
+        }
 
         log.info("上传成功 userId={}, fileId={}, filename={}, size={}, reused={}",
                 userId, userFile.getId(), filename, realFile.getFileSize(), reused);
@@ -315,6 +338,188 @@ public class FileServiceImpl implements FileService {
         log.info("从回收站恢复 userId={}, userFileId={}, filename={}",
                 userId, userFile.getId(), userFile.getFilename());
         return true;
+    }
+
+    /**
+     * 彻底删除单条回收站记录。
+     * <p>
+     * 强制两步走：只接受 {@code is_delete=1}。列表态文件必须先软删除，
+     * 这样用户还有一次"我是不是删错了"的缓冲，也避免误点直接毁掉数据。
+     */
+    @Override
+    public PurgeItemVO purge(Long userFileId) {
+        return purgeOne(userFileId, requireUserId());
+    }
+
+    /**
+     * 单条彻底删除的实际实现。
+     * <p>
+     * userId 由调用方传入而不是内部再读 ThreadLocal：清空回收站时一次取到身份，
+     * 逐条复用这份身份，避免每条都重复取值、也让"只能删自己的"这一点在调用点就一目了然。
+     */
+    private PurgeItemVO purgeOne(Long userFileId, Long userId) {
+
+        // 事务块内只做数据库操作：删 user_file 行、ref_count-1、必要时删 real_file 行。
+        // transactionTemplate.execute() 正常返回时事务已经提交，之后的磁盘删除才安全。
+        PurgePlan plan = transactionTemplate.execute(status -> {
+            // 1. 先按 id + user_id 查（故意不加 is_delete 条件）：
+            //    "不存在 / 别人的 / 列表态" 要统一成 404，但列表态要和"已在回收站"区分开
+            UserFile userFile = userFileMapper.selectOne(new LambdaQueryWrapper<UserFile>()
+                    .eq(UserFile::getId, userFileId)
+                    .eq(UserFile::getUserId, userId));
+            if (userFile == null || !Integer.valueOf(1).equals(userFile.getIsDelete())) {
+                // 三种情况统一 40401 + 统一文案，不给 403，防 id 枚举
+                throw new BusinessException(40401, "文件不存在或无权访问");
+            }
+
+            // 2. 锁住对应的 real_file 行（SELECT ... FOR UPDATE）。
+            //    同一份物理文件可能被多个用户引用，并发彻底删除时靠这把行锁串行化，
+            //    保证 ref_count 不会在两个事务里同时被读到旧值。
+            //    last("FOR UPDATE") 是 MyBatis-Plus 的拼接尾巴，参数是常量、无外部输入，不存在注入。
+            RealFile realFile = realFileMapper.selectOne(new LambdaQueryWrapper<RealFile>()
+                    .eq(RealFile::getId, userFile.getRealFileId())
+                    .last("FOR UPDATE"));
+            if (realFile == null) {
+                // user_file 指向的 real_file 不存在，属于库被改坏，不是用户的错；ERROR 留给人工处理
+                log.error("数据不一致: 彻底删除时 real_file 不存在. userFileId={}, realFileId={}",
+                        userFile.getId(), userFile.getRealFileId());
+                throw new BusinessException(40402, "文件内容缺失，无法彻底删除");
+            }
+
+            // 3. 条件删 user_file 行：is_delete=1 写进 WHERE，防并发恢复抢在前面。
+            //    影响 0 行说明这一瞬间被恢复或被另一个请求彻底删了，统一按"不可见"处理
+            int removed = userFileMapper.delete(new LambdaQueryWrapper<UserFile>()
+                    .eq(UserFile::getId, userFileId)
+                    .eq(UserFile::getUserId, userId)
+                    .eq(UserFile::getIsDelete, 1));
+            if (removed == 0) {
+                throw new BusinessException(40401, "文件不存在或无权访问");
+            }
+
+            // 4. 递减引用计数。用 SQL 自减而不是"读出来再 set"，避免并发算丢；
+            //    ref_count > 0 是防下溢条件：真出现 0 还来递减，说明数据已经不一致，宁可回滚也不删成负数
+            int decreased = realFileMapper.update(null, new LambdaUpdateWrapper<RealFile>()
+                    .setSql("ref_count = ref_count - 1")
+                    .eq(RealFile::getId, realFile.getId())
+                    .gt(RealFile::getRefCount, 0));
+            if (decreased == 0) {
+                log.error("数据不一致: ref_count 已是 0，无法递减. realFileId={}", realFile.getId());
+                throw new BusinessException(500, "数据不一致，请稍后重试");
+            }
+
+            // 锁内读到的值就是当前已提交值，直接减 1 即可，不用再查一次
+            int refCountAfter = (realFile.getRefCount() == null ? 0 : realFile.getRefCount()) - 1;
+            if (refCountAfter > 0) {
+                // 还有人引用（秒传共享）：real_file 行和物理文件都必须保留
+                return new PurgePlan(null, refCountAfter, userFile.getFilename());
+            }
+
+            // 5. 引用归零：删 real_file 行。条件里带 ref_count=0，双保险
+            int realRemoved = realFileMapper.delete(new LambdaQueryWrapper<RealFile>()
+                    .eq(RealFile::getId, realFile.getId())
+                    .eq(RealFile::getRefCount, 0));
+            if (realRemoved == 0) {
+                log.error("删除 real_file 失败（可能被并发修改）. realFileId={}", realFile.getId());
+                throw new BusinessException(500, "数据不一致，请稍后重试");
+            }
+            return new PurgePlan(realFile, 0, userFile.getFilename());
+        });
+
+        if (plan == null) {
+            // execute 的回调永远有返回值，这里只是把"理论上不可能"变成明确的失败，而不是 NPE
+            throw new BusinessException("彻底删除失败，请稍后重试");
+        }
+
+        // ---------- 事务已提交，从这里开始删物理文件 ----------
+        // 顺序绝不能反：先删盘再提交，一旦回滚就留下"库有盘无"的失踪文件；
+        // 按这个顺序最坏情况只是"库无盘有"的孤儿文件，巡检 orphan 段能查出来。
+        boolean physicalDeleted = false;
+        if (plan.physicalToDelete() != null) {
+            RealFile file = plan.physicalToDelete();
+            // 路径只来自 real_file.file_path（服务端生成的 UUID 路径），不接受任何外部输入；
+            // storageService.delete 内部还会 normalize + 校验必须仍在存储根目录下，防路径穿越
+            log.info("彻底删除物理文件: path={}, size={}, md5={}",
+                    file.getFilePath(), file.getFileSize(), file.getMd5());
+            physicalDeleted = storageService.delete(file.getFilePath());
+            if (!physicalDeleted) {
+                // 删盘失败不影响结果：数据库已经一致了，磁盘上多出的文件就是孤儿，巡检能报出来。
+                // 这里绝不能抛异常回滚 —— 事务早就提交了，抛了也回滚不了，只会让用户以为没删成功
+                log.error("物理文件删除失败，已产生孤儿文件（巡检 orphan 可检出）: realFileId={}, path={}",
+                        file.getId(), file.getFilePath());
+            }
+        } else {
+            log.info("物理文件仍被引用，保留: userFileId={}, refCount={}", userFileId, plan.refCountAfter());
+        }
+
+        log.info("彻底删除完成 userId={}, userFileId={}, filename={}, refCountAfter={}, physicalDeleted={}",
+                userId, userFileId, plan.filename(), plan.refCountAfter(), physicalDeleted);
+
+        return PurgeItemVO.builder()
+                .id(userFileId)
+                .filename(plan.filename())
+                .refCountAfter(plan.refCountAfter())
+                .shared(plan.refCountAfter() > 0)
+                .physicalDeleted(physicalDeleted)
+                .status("deleted")
+                .build();
+    }
+
+    /**
+     * 清空回收站：一次只圈定当前用户的 {@code is_delete=1} 记录，然后逐条走 {@link #purge} 的同一套逻辑。
+     * <p>
+     * 为什么不写一条批量 SQL：批量 DELETE 绕过了"锁 real_file、递减 ref_count、共享保护、删盘"这些复核，
+     * 而且一条失败会整批回滚。逐条处理虽然多几次查询，但语义和单条完全一致，失败也可隔离。
+     */
+    @Override
+    public PurgeBatchVO purgeAllRecycle() {
+        Long userId = requireUserId();
+
+        // 清单只由服务端按 user_id 圈定，前端没有任何机会指定别人的记录
+        List<UserFile> recycleRows = userFileMapper.selectList(new LambdaQueryWrapper<UserFile>()
+                .select(UserFile::getId, UserFile::getFilename)
+                .eq(UserFile::getUserId, userId)
+                .eq(UserFile::getIsDelete, 1)
+                .orderByAsc(UserFile::getId));
+
+        List<PurgeItemVO> items = new ArrayList<>(recycleRows.size());
+        int deleted = 0;
+        for (UserFile row : recycleRows) {
+            try {
+                // 与单条接口同一个方法：越权、状态、共享、物理删除的复核一个都不少
+                items.add(purgeOne(row.getId(), userId));
+                deleted++;
+            } catch (BusinessException e) {
+                // 并发场景：这一条可能在查询清单之后被恢复或被另一个请求删掉。
+                // 记失败但继续处理剩下的，不因为一条失败丢掉整批
+                log.warn("清空回收站时跳过一条: userFileId={}, reason={}", row.getId(), e.getMessage());
+                items.add(PurgeItemVO.builder()
+                        .id(row.getId())
+                        .filename(row.getFilename())
+                        .status("failed")
+                        .reason(e.getMessage())
+                        .build());
+            }
+        }
+
+        log.info("清空回收站完成 userId={}, requested={}, deleted={}, failed={}",
+                userId, recycleRows.size(), deleted, recycleRows.size() - deleted);
+
+        return PurgeBatchVO.builder()
+                .requestedCount(recycleRows.size())
+                .deletedCount(deleted)
+                .failedCount(recycleRows.size() - deleted)
+                .items(items)
+                .build();
+    }
+
+    /**
+     * 事务内算出的执行计划。
+     *
+     * @param physicalToDelete 需要在事务提交后删除的物理文件；共享保留时为 null
+     * @param refCountAfter    递减后的引用数
+     * @param filename         文件名（日志与响应要用）
+     */
+    private record PurgePlan(RealFile physicalToDelete, int refCountAfter, String filename) {
     }
 
     @Override

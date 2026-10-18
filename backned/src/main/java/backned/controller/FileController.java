@@ -6,6 +6,8 @@ import backned.vo.DownloadFileVO;
 import backned.vo.FileItemVO;
 import backned.vo.FileUploadVO;
 import backned.vo.PageVO;
+import backned.vo.PurgeBatchVO;
+import backned.vo.PurgeItemVO;
 import backned.vo.RecycleItemVO;
 import backned.vo.UploadConfigVO;
 import lombok.RequiredArgsConstructor;
@@ -109,6 +111,31 @@ public class FileController {
     public Result<Void> restore(@PathVariable Long userFileId) {
         boolean changed = fileService.restore(userFileId);
         return Result.success(changed ? "已恢复" : "文件已在列表中，无需恢复", null);
+    }
+
+    /**
+     * 彻底删除回收站中的一条记录（不可恢复）。
+     * <p>
+     * 路径挂在 {@code /recycle} 下而不是复用 {@code DELETE /api/file/{id}}：
+     * 同一个 URL 做两件语义不同的事（软删除 vs 彻底删除）会让客户端传错参数时无法被察觉。
+     * 这里也强制"两步走"：只有已在回收站的记录才能彻底删除，列表态文件返回 404。
+     * <p>
+     * 字面量 {@code /recycle} 比 {@code /{userFileId}} 优先匹配，所以不会和上一行的单段路径冲突。
+     */
+    @DeleteMapping("/recycle/{userFileId}")
+    public Result<PurgeItemVO> purge(@PathVariable Long userFileId) {
+        return Result.success("已彻底删除", fileService.purge(userFileId));
+    }
+
+    /**
+     * 清空当前用户的回收站。
+     * <p>
+     * 不需要请求体：范围由服务端的登录态圈定（user_id + is_delete=1），前端传不了"别人的 id"。
+     * 返回逐条结果，允许部分成功（并发下某条可能已被恢复）。
+     */
+    @DeleteMapping("/recycle")
+    public Result<PurgeBatchVO> purgeAll() {
+        return Result.success("已清空回收站", fileService.purgeAllRecycle());
     }
 
     /**

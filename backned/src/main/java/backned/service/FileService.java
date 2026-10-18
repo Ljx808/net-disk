@@ -4,6 +4,8 @@ import backned.vo.DownloadFileVO;
 import backned.vo.FileItemVO;
 import backned.vo.FileUploadVO;
 import backned.vo.PageVO;
+import backned.vo.PurgeBatchVO;
+import backned.vo.PurgeItemVO;
 import backned.vo.RecycleItemVO;
 import backned.vo.UploadConfigVO;
 import org.springframework.web.multipart.MultipartFile;
@@ -50,6 +52,25 @@ public interface FileService {
      * @throws backned.common.BusinessException 40401 文件不存在或无权访问；40901 同目录同名冲突
      */
     boolean restore(Long userFileId);
+
+    /**
+     * 彻底删除一条回收站记录：删 {@code user_file} 行、{@code ref_count - 1}，
+     * 引用数归零时再删 {@code real_file} 行和物理文件。
+     * <p>
+     * 只接受 {@code is_delete=1} 的记录，列表态文件必须先软删除（强制两步走）；
+     * 不存在 / 不是自己的 / 不在回收站，对外统一 40401，不区分。
+     *
+     * @throws backned.common.BusinessException 40401 文件不存在或无权访问；40402 记录在但内容缺失
+     */
+    PurgeItemVO purge(Long userFileId);
+
+    /**
+     * 清空当前用户的回收站。
+     * <p>
+     * 服务端按登录用户圈定全部 {@code is_delete=1} 的记录，逐条走与 {@link #purge} 完全相同的逻辑
+     * （含越权、状态、共享、物理删除的全部复核）。单条失败不中断整批，结果逐条返回。
+     */
+    PurgeBatchVO purgeAllRecycle();
 
     /** 上传相关配置。前端启动时拿它显示"单文件最大 xxx"，避免把限制写死在页面上 */
     UploadConfigVO getUploadConfig();
