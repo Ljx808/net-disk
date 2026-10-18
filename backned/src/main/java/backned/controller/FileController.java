@@ -1,6 +1,7 @@
 package backned.controller;
 
 import backned.common.Result;
+import backned.dto.CreateFolderDTO;
 import backned.service.FileService;
 import backned.vo.DownloadFileVO;
 import backned.vo.FileItemVO;
@@ -10,6 +11,7 @@ import backned.vo.PurgeBatchVO;
 import backned.vo.PurgeItemVO;
 import backned.vo.RecycleItemVO;
 import backned.vo.UploadConfigVO;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.io.Resource;
@@ -23,6 +25,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -51,8 +54,21 @@ public class FileController {
      * 请求必须是 multipart/form-data，表单字段名固定为 file（要和前端 FormData.append('file', ...) 对上）。
      */
     @PostMapping("/upload")
-    public Result<FileUploadVO> upload(@RequestParam("file") MultipartFile file) {
-        return Result.success("上传成功", fileService.upload(file));
+    public Result<FileUploadVO> upload(
+            @RequestParam("file") MultipartFile file,
+            @RequestParam(value = "parentId", defaultValue = "0") Long parentId) {
+        return Result.success("上传成功", fileService.upload(file, parentId));
+    }
+
+    /**
+     * 新建文件夹。
+     * <p>
+     * 参数走 JSON 请求体而不是 query：文件夹名可能含空格/中文，放 body 更好处理；
+     * 校验注解由 {@code @Valid} 触发，失败走全局异常处理 → HTTP 400 + 40000。
+     */
+    @PostMapping("/folder")
+    public Result<FileItemVO> createFolder(@Valid @RequestBody CreateFolderDTO dto) {
+        return Result.success("文件夹创建成功", fileService.createFolder(dto));
     }
 
     /**
@@ -68,8 +84,9 @@ public class FileController {
     @GetMapping("/list")
     public Result<PageVO<FileItemVO>> list(
             @RequestParam(defaultValue = "1") long pageNum,
-            @RequestParam(defaultValue = "10") long pageSize) {
-        return Result.success(fileService.listMine(pageNum, pageSize));
+            @RequestParam(defaultValue = "10") long pageSize,
+            @RequestParam(defaultValue = "0") Long parentId) {
+        return Result.success(fileService.listMine(pageNum, pageSize, parentId));
     }
 
     /**

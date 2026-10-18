@@ -18,7 +18,11 @@ public class RecycleItemVO {
 
     private String filename;
 
+    /** 文件夹固定为 0 */
     private Long fileSize;
+
+    /** true=文件夹。回收站里文件夹与文件混排，恢复/彻底删除走同一套接口 */
+    private Boolean isFolder;
 
     /**
      * 移入回收站的时间。

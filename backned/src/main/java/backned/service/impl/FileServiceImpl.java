@@ -1,6 +1,7 @@
 package backned.service.impl;
 
 import backned.common.BusinessException;
+import backned.dto.CreateFolderDTO;
 import backned.entity.RealFile;
 import backned.entity.UserFile;
 import backned.mapper.RealFileMapper;
@@ -37,6 +38,7 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -81,10 +83,14 @@ public class FileServiceImpl implements FileService {
      *    事务已被标记为 rollback-only，最后提交时会抛 UnexpectedRollbackException，反而更糟。
      */
     @Override
-    public FileUploadVO upload(MultipartFile file) {
+    public FileUploadVO upload(MultipartFile file, Long parentId) {
         // 1. 用户身份只认 ThreadLocal 里拦截器解析出来的值。
         //    接口签名里没有 userId 参数，前端就算多传一个 userId 也进不来，从根上避免了越权上传。
         Long userId = requireUserId();
+
+        // 2. 先校验目标目录，再算 md5、再落盘：目录不合法时不该产生任何磁盘副作用
+        long targetParentId = normalizeParentId(parentId);
+        requireFolder(targetParentId, userId);
 
         if (file == null || file.isEmpty()) {
             // 400 而不是默认的 500：这是调用方传错了，不是服务端故障
@@ -118,8 +124,9 @@ public class FileServiceImpl implements FileService {
         userFile.setUserId(userId);
         userFile.setRealFileId(realFile.getId());
         userFile.setFilename(filename);
-        userFile.setParentId(0L);
+        userFile.setParentId(targetParentId);
         userFile.setIsDelete(0);
+        userFile.setIsFolder(0);
         // 时间字段在代码里显式赋值，而不是依赖 MySQL 的 DEFAULT CURRENT_TIMESTAMP：
         // MyBatis-Plus 插入后不会把数据库生成的列值回读进实体，
         // 不显式赋值的话下面 toVO 拿到的 createTime 就是 null。
@@ -161,8 +168,12 @@ public class FileServiceImpl implements FileService {
      * 代码里也做了防御，取不到就给 0 而不是让整个列表报 500）。
      */
     @Override
-    public PageVO<FileItemVO> listMine(long pageNum, long pageSize) {
+    public PageVO<FileItemVO> listMine(long pageNum, long pageSize, Long parentId) {
         Long userId = requireUserId();
+        long targetParentId = normalizeParentId(parentId);
+        // 进不存在的 / 别人的 / 已删除的目录，统一 404，不返回空列表：
+        // 空列表会让前端以为"这个目录是空的"，而实际是路径失效了
+        requireFolder(targetParentId, userId);
 
         // 夹紧分页参数。pageSize 不夹紧的话，前端传个 100000 就能把整张表拉出来，
         // 这是个很常见的低级漏洞（接口防刷的基本功）。
@@ -175,8 +186,11 @@ public class FileServiceImpl implements FileService {
         // 越权这道防线必须在 SQL 层面就堵死，前端传什么 userId 都进不来
         LambdaQueryWrapper<UserFile> wrapper = new LambdaQueryWrapper<UserFile>()
                 .eq(UserFile::getUserId, userId)
-                .eq(UserFile::getParentId, 0L)   // Day5 只有根目录，目录结构是后续的事
+                .eq(UserFile::getParentId, targetParentId)
                 .eq(UserFile::getIsDelete, 0)    // 回收站里的记录不出现
+                // 文件夹在前；两组内部都按创建时间倒序。
+                // 索引 idx_user_parent_time 的列顺序与这组排序完全对应，正常不会 filesort
+                .orderByDesc(UserFile::getIsFolder)
                 .orderByDesc(UserFile::getCreateTime)
                 // 按时间排序一定要带上 id 兜底：同一秒上传的多个文件 create_time 完全相同，
                 // MySQL 对"排序值相同的行"顺序不保证稳定，翻页时会出现同一行重复出现或漏掉
@@ -185,15 +199,55 @@ public class FileServiceImpl implements FileService {
 
         Map<Long, RealFile> realFileMap = loadRealFileMap(page.getRecords());
 
-        return PageVO.of(page, userFile -> {
-            RealFile realFile = realFileMap.get(userFile.getRealFileId());
-            FileItemVO vo = new FileItemVO();
-            vo.setId(userFile.getId());
-            vo.setFilename(userFile.getFilename());
-            vo.setFileSize(realFile == null ? 0L : realFile.getFileSize());
-            vo.setCreateTime(userFile.getCreateTime());
-            return vo;
-        });
+        return PageVO.of(page, userFile -> toFileItemVO(userFile, realFileOf(realFileMap, userFile)));
+    }
+
+    /**
+     * 新建文件夹。
+     * <p>
+     * 与上传一样，文件夹也落在 user_file 表里，只是 real_file_id 为 NULL。
+     * 这样列表、回收站、恢复、彻底删除都能复用现成的查询和状态机，不需要第二张表。
+     */
+    @Override
+    public FileItemVO createFolder(CreateFolderDTO dto) {
+        Long userId = requireUserId();
+        long parentId = normalizeParentId(dto.getParentId());
+        requireFolder(parentId, userId);
+
+        // DTO 的 @Valid 已经挡掉空白、超长、分隔符、控制字符和小数点整名；
+        // 这里 trim 是为了让 "  资料  " 和 "资料" 视为同名，落库也统一成去掉首尾空格的名字
+        String name = dto.getFoldername().trim();
+        if (name.isEmpty()) {
+            throw new BusinessException(400, "文件夹名不能为空");
+        }
+
+        // 同目录重名检查：文件和文件夹共用一个命名空间，和操作系统的直觉一致。
+        // is_delete=0 才算冲突：回收站里的同名项允许存在，恢复时再报 409（现有语义不变）
+        Long conflict = userFileMapper.selectCount(new LambdaQueryWrapper<UserFile>()
+                .eq(UserFile::getUserId, userId)
+                .eq(UserFile::getParentId, parentId)
+                .eq(UserFile::getFilename, name)
+                .eq(UserFile::getIsDelete, 0));
+        if (conflict != null && conflict > 0) {
+            throw new BusinessException(40901, "同目录下已存在同名文件或文件夹「" + name + "」，请换一个名字");
+        }
+
+        UserFile folder = new UserFile();
+        folder.setUserId(userId);
+        folder.setRealFileId(null);   // 文件夹没有物理文件
+        folder.setFilename(name);
+        folder.setParentId(parentId);
+        folder.setIsDelete(0);
+        folder.setIsFolder(1);
+        // 时间字段显式赋值，理由和上传一致：MyBatis-Plus 不会回读数据库生成的默认值
+        LocalDateTime now = LocalDateTime.now();
+        folder.setCreateTime(now);
+        folder.setUpdateTime(now);
+        userFileMapper.insert(folder);
+
+        log.info("新建文件夹 userId={}, folderId={}, parentId={}, name={}",
+                userId, folder.getId(), parentId, name);
+        return toFileItemVO(folder, null);
     }
 
     /**
@@ -224,12 +278,13 @@ public class FileServiceImpl implements FileService {
         Map<Long, RealFile> realFileMap = loadRealFileMap(page.getRecords());
 
         return PageVO.of(page, userFile -> {
-            RealFile realFile = realFileMap.get(userFile.getRealFileId());
+            RealFile realFile = realFileOf(realFileMap, userFile);
             RecycleItemVO vo = new RecycleItemVO();
             vo.setId(userFile.getId());
             vo.setFilename(userFile.getFilename());
             // real_file 理论上一定在；真被改坏了也给 0，不让整个回收站列表报 500
             vo.setFileSize(realFile == null ? 0L : realFile.getFileSize());
+            vo.setIsFolder(Integer.valueOf(1).equals(userFile.getIsFolder()));
             vo.setDeleteTime(userFile.getUpdateTime());
             return vo;
         });
@@ -258,6 +313,18 @@ public class FileServiceImpl implements FileService {
         }
         if (Integer.valueOf(1).equals(userFile.getIsDelete())) {
             return false; // 幂等：本来就在回收站
+        }
+
+        // 文件夹必须为空才能软删除（递归删除本轮不做）。
+        // 子项统计故意不过滤 is_delete：回收站里的子行仍可能被恢复，
+        // 父目录先没了，恢复出来的就是一条父目录不存在的死层级。
+        if (Integer.valueOf(1).equals(userFile.getIsFolder())) {
+            Long childCount = userFileMapper.selectCount(new LambdaQueryWrapper<UserFile>()
+                    .eq(UserFile::getUserId, userId)
+                    .eq(UserFile::getParentId, userFile.getId()));
+            if (childCount != null && childCount > 0) {
+                throw new BusinessException(40902, "文件夹非空，请先清空文件夹里的内容再删除");
+            }
         }
 
         // 条件里带 is_delete=0，防并发重复删除。
@@ -301,6 +368,19 @@ public class FileServiceImpl implements FileService {
         }
         if (Integer.valueOf(0).equals(userFile.getIsDelete())) {
             return false; // 幂等：本来就在文件列表里
+        }
+
+        // 父目录必须还在（未删除）：否则恢复出来的是挂在已删除目录下的悬空记录。
+        // 本轮不做"连带恢复父目录"，明确报错让用户按层级从外到内恢复
+        if (userFile.getParentId() != null && userFile.getParentId() != 0L) {
+            UserFile parent = userFileMapper.selectOne(new LambdaQueryWrapper<UserFile>()
+                    .eq(UserFile::getId, userFile.getParentId())
+                    .eq(UserFile::getUserId, userId)
+                    .eq(UserFile::getIsDelete, 0)
+                    .eq(UserFile::getIsFolder, 1));
+            if (parent == null) {
+                throw new BusinessException(40903, "父目录已删除或不存在，请先恢复父目录");
+            }
         }
 
         // 同 user、同目录、同名、未删除、且不是自己 → 冲突。
@@ -370,6 +450,26 @@ public class FileServiceImpl implements FileService {
             if (userFile == null || !Integer.valueOf(1).equals(userFile.getIsDelete())) {
                 // 三种情况统一 40401 + 统一文案，不给 403，防 id 枚举
                 throw new BusinessException(40401, "文件不存在或无权访问");
+            }
+
+            // 文件夹没有 real_file、没有 ref_count、没有磁盘文件：
+            // 只删 user_file 行。删前再复核一次"没有子项"——正常流程走不到（软删除时已拦），
+            // 这里是防御性检查，避免将来别处直接调用造成子行悬空
+            if (Integer.valueOf(1).equals(userFile.getIsFolder())) {
+                Long childCount = userFileMapper.selectCount(new LambdaQueryWrapper<UserFile>()
+                        .eq(UserFile::getUserId, userId)
+                        .eq(UserFile::getParentId, userFile.getId()));
+                if (childCount != null && childCount > 0) {
+                    throw new BusinessException(40902, "文件夹非空，请先清空文件夹里的内容再彻底删除");
+                }
+                int folderRemoved = userFileMapper.delete(new LambdaQueryWrapper<UserFile>()
+                        .eq(UserFile::getId, userFileId)
+                        .eq(UserFile::getUserId, userId)
+                        .eq(UserFile::getIsDelete, 1));
+                if (folderRemoved == 0) {
+                    throw new BusinessException(40401, "文件不存在或无权访问");
+                }
+                return new PurgePlan(null, null, userFile.getFilename());
             }
 
             // 2. 锁住对应的 real_file 行（SELECT ... FOR UPDATE）。
@@ -447,6 +547,8 @@ public class FileServiceImpl implements FileService {
                 log.error("物理文件删除失败，已产生孤儿文件（巡检 orphan 可检出）: realFileId={}, path={}",
                         file.getId(), file.getFilePath());
             }
+        } else if (plan.refCountAfter() == null) {
+            log.info("彻底删除文件夹（无物理文件）: userFileId={}, filename={}", userFileId, plan.filename());
         } else {
             log.info("物理文件仍被引用，保留: userFileId={}, refCount={}", userFileId, plan.refCountAfter());
         }
@@ -458,7 +560,7 @@ public class FileServiceImpl implements FileService {
                 .id(userFileId)
                 .filename(plan.filename())
                 .refCountAfter(plan.refCountAfter())
-                .shared(plan.refCountAfter() > 0)
+                .shared(plan.refCountAfter() != null && plan.refCountAfter() > 0)
                 .physicalDeleted(physicalDeleted)
                 .status("deleted")
                 .build();
@@ -515,11 +617,11 @@ public class FileServiceImpl implements FileService {
     /**
      * 事务内算出的执行计划。
      *
-     * @param physicalToDelete 需要在事务提交后删除的物理文件；共享保留时为 null
-     * @param refCountAfter    递减后的引用数
+     * @param physicalToDelete 需要在事务提交后删除的物理文件；共享保留或文件夹时为 null
+     * @param refCountAfter    递减后的引用数；文件夹没有计数，为 null
      * @param filename         文件名（日志与响应要用）
      */
-    private record PurgePlan(RealFile physicalToDelete, int refCountAfter, String filename) {
+    private record PurgePlan(RealFile physicalToDelete, Integer refCountAfter, String filename) {
     }
 
     @Override
@@ -552,6 +654,11 @@ public class FileServiceImpl implements FileService {
             // 探测出某个 id 是否存在（文件存在性泄露），能遍历出别人有哪些文件
             throw new BusinessException(40401, "文件不存在或无权访问");
         }
+
+        // 所有"按 userFileId 取文件内容"的入口都必须先过这一道：文件夹没有内容可取。
+        // 40003 落在 400xx 区间 → 真正的 HTTP 400（前端 axios 走 blob 下载时，
+        // 只有 HTTP 状态码错误才会进入 catch，否则会把错误 JSON 当成文件存下来）
+        assertNotFolder(userFile);
 
         RealFile realFile = realFileMapper.selectById(userFile.getRealFileId());
         if (realFile == null) {
@@ -596,6 +703,43 @@ public class FileServiceImpl implements FileService {
         return userId;
     }
 
+    /** null 与 0 都表示根目录，统一成 long 方便后续比较和查库 */
+    private long normalizeParentId(Long parentId) {
+        return parentId == null ? 0L : parentId;
+    }
+
+    /**
+     * 校验父目录：必须是当前用户的、未删除的、真正的文件夹。
+     * <p>
+     * 三种失败（不存在 / 别人的 / 本身是文件）统一 40401 + 统一文案，不区分，防 id 枚举。
+     * 根目录（0）直接放行，它没有对应的行。
+     */
+    private void requireFolder(long parentId, Long userId) {
+        if (parentId == 0L) {
+            return;
+        }
+        UserFile parent = userFileMapper.selectOne(new LambdaQueryWrapper<UserFile>()
+                .eq(UserFile::getId, parentId)
+                .eq(UserFile::getUserId, userId)
+                .eq(UserFile::getIsDelete, 0)
+                .eq(UserFile::getIsFolder, 1));
+        if (parent == null) {
+            throw new BusinessException(40401, "文件夹不存在或无权访问");
+        }
+    }
+
+    /**
+     * 按 id 取内容类接口的公共拦截：文件夹没有内容。
+     * <p>
+     * 抽成方法而不是在下载里写 if：以后加预览、缩略图、按 id 秒传等入口时，
+     * 只要第一行调用它就不会漏。业务码 40003 落在 400xx 区间，映射为 HTTP 400。
+     */
+    private void assertNotFolder(UserFile userFile) {
+        if (Integer.valueOf(1).equals(userFile.getIsFolder())) {
+            throw new BusinessException(40003, "文件夹不支持下载");
+        }
+    }
+
     /**
      * 一次批量取回本页涉及的 real_file，避免 N+1 查询。
      * <p>
@@ -603,14 +747,40 @@ public class FileServiceImpl implements FileService {
      * 那会拼出 {@code where id in ()} 这种语法错误的 SQL。
      */
     private Map<Long, RealFile> loadRealFileMap(List<UserFile> records) {
+        // 文件夹行的 real_file_id 是 NULL，必须先过滤：
+        // 丢给 selectByIds 会拼出 IN (null, 1, 2)，虽然不报错，但没有任何意义
         List<Long> realFileIds = records.stream()
                 .map(UserFile::getRealFileId)
+                .filter(Objects::nonNull)
                 .distinct()
                 .toList();
         return realFileIds.isEmpty()
                 ? Map.of()
                 : realFileMapper.selectByIds(realFileIds).stream()
                         .collect(Collectors.toMap(RealFile::getId, Function.identity()));
+    }
+
+    /**
+     * 从 real_file 映射里取一条记录。
+     * <p>
+     * 文件夹行的 real_file_id 是 NULL，不能直接 {@code map.get(null)}：
+     * {@link #loadRealFileMap} 在整页都是文件夹时返回 {@code Map.of()}，
+     * 而不可变 Map 对 null 键会抛 NPE（实测：回收站里只有文件夹时列表直接 500）。
+     * 统一从这个方法取，调用方不用各自判空。
+     */
+    private RealFile realFileOf(Map<Long, RealFile> realFileMap, UserFile userFile) {
+        return userFile.getRealFileId() == null ? null : realFileMap.get(userFile.getRealFileId());
+    }
+
+    /** 文件/文件夹行 → 列表 VO。文件夹没有物理文件，大小固定 0 */
+    private FileItemVO toFileItemVO(UserFile userFile, RealFile realFile) {
+        FileItemVO vo = new FileItemVO();
+        vo.setId(userFile.getId());
+        vo.setFilename(userFile.getFilename());
+        vo.setFileSize(realFile == null ? 0L : realFile.getFileSize());
+        vo.setIsFolder(Integer.valueOf(1).equals(userFile.getIsFolder()));
+        vo.setCreateTime(userFile.getCreateTime());
+        return vo;
     }
 
     /**

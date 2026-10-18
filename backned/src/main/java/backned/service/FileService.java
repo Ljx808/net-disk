@@ -1,5 +1,6 @@
 package backned.service;
 
+import backned.dto.CreateFolderDTO;
 import backned.vo.DownloadFileVO;
 import backned.vo.FileItemVO;
 import backned.vo.FileUploadVO;
@@ -12,17 +13,27 @@ import org.springframework.web.multipart.MultipartFile;
 
 public interface FileService {
 
-    /** 上传单个文件，返回这条文件记录的信息 */
-    FileUploadVO upload(MultipartFile file);
+    /** 上传单个文件到指定目录（parentId=0 为根目录），返回这条文件记录的信息 */
+    FileUploadVO upload(MultipartFile file, Long parentId);
 
     /**
-     * 分页查询当前登录用户根目录（parentId=0）下未删除的文件。
+     * 分页查询当前登录用户指定目录（parentId=0 为根目录）下未删除的文件与文件夹。
      * 查谁的文件由 ThreadLocal 里的登录态决定，参数里没有 userId。
+     * 排序为"文件夹在前，各自按创建时间倒序"。
      *
      * @param pageNum  页码，从 1 开始，非法值由实现类夹紧
      * @param pageSize 每页条数，非法值由实现类夹紧
+     * @param parentId 父目录 id，null 或 0 表示根目录
      */
-    PageVO<FileItemVO> listMine(long pageNum, long pageSize);
+    PageVO<FileItemVO> listMine(long pageNum, long pageSize, Long parentId);
+
+    /**
+     * 新建文件夹。
+     * <p>
+     * 父目录必须存在、属于当前用户、未被删除且本身是文件夹，否则 40401；
+     * 同目录下已存在同名文件或文件夹（未删除）时返回 40901，不自动改名。
+     */
+    FileItemVO createFolder(CreateFolderDTO dto);
 
     /**
      * 分页查询当前登录用户的回收站（{@code is_delete=1} 的记录）。

@@ -22,17 +22,26 @@ public class UserFile {
 
     private Long userId;
 
-    /** 指向 real_file.id，真正的文件内容在那张表对应路径上 */
+    /** 指向 real_file.id，真正的文件内容在那张表对应路径上；文件夹行没有物理文件，为 NULL */
     private Long realFileId;
 
     /** 原始文件名，用户看到的就是它 */
     private String filename;
 
-    /** 父目录 id，0 表示根目录。Day4 固定传 0，为 Day5 的目录结构预留 */
+    /** 父目录 id，0 表示根目录 */
     private Long parentId;
 
     /** 0 正常 1 回收站，配合 @TableLogic 可以做到"删除只是标记" */
     private Integer isDelete;
+
+    /**
+     * 0 文件 1 文件夹。
+     * <p>
+     * 用一张表存文件与文件夹，是因为它们的"归属、父目录、回收站、恢复"语义完全一样，
+     * 区别只有两处：文件夹没有 real_file_id、不能下载。
+     * 如果拆成两张表，列表要 union、回收站要 union、恢复/彻底删除都要写两套，复杂度反而更高。
+     */
+    private Integer isFolder;
 
     private LocalDateTime createTime;
 

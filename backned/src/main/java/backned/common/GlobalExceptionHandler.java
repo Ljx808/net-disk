@@ -39,8 +39,8 @@ import java.util.stream.Collectors;
  * <p>
  * <b>编码规则（两条线，别混）</b>：
  * <ul>
- *   <li>业务异常 {@link BusinessException}：带自己的细粒度业务码（401、40401、40402…），
- *       其中 404xx 映射成真正的 HTTP 404、409xx 映射成真正的 HTTP 409，
+ *   <li>业务异常 {@link BusinessException}：带自己的细粒度业务码（401、40003、40401、40901…），
+ *       其中 400xx 映射成真正的 HTTP 400、404xx 映射成真正的 HTTP 404、409xx 映射成真正的 HTTP 409，
  *       其余维持 HTTP 200（历史行为，见 {@link #toHttpStatus}）。</li>
  *   <li>框架异常：HTTP 状态码是它自己的语义（400/404/405/415/500），业务码统一取
  *       {@code HTTP 状态码 × 100}（404 → 40400、400 → 40000），前端看 code 的前三位
@@ -62,6 +62,17 @@ import java.util.stream.Collectors;
 @Slf4j
 @RestControllerAdvice
 public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
+
+    /**
+     * 业务码 400xx 的区间：请求本身不合法（如对文件夹发起下载）。
+     * <p>
+     * 必须是真正的 HTTP 400，不能是 HTTP 200 + body code：
+     * 前端用 blob 方式下载时，axios 只在 HTTP 状态码非 2xx 时走 catch，
+     * 状态码 200 会把错误 JSON 当成文件内容保存下来。
+     * 区间从 40000 开始，已有的业务码 400（HTTP 200 语义）不在区间内，行为不变。
+     */
+    private static final int BAD_REQUEST_CODE_START = 40000;
+    private static final int BAD_REQUEST_CODE_END = 40100;
 
     /** 业务码 404xx 的区间：文件不存在 / 无权访问 / 内容缺失，这类要映射成真正的 HTTP 404 */
     private static final int NOT_FOUND_CODE_START = 40400;
@@ -95,7 +106,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     /**
      * 业务码 → HTTP 状态码。
      * <p>
-     * 目前映射两个区间：404xx → 404、409xx → 409；其余一律维持 HTTP 200。
+     * 目前映射三个区间：400xx → 400、404xx → 404、409xx → 409；其余一律维持 HTTP 200。
      * 维持 HTTP 200 是有意的保守做法，不是在偷懒：401/400 目前的表现是
      * HTTP 200 + body 里的 code，前端拦截器就是按这个行为写的（比如 401 会触发跳登录页），
      * 那些接口 Day4/Day5 已经验收过了。
@@ -108,6 +119,9 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     private HttpStatus toHttpStatus(Integer code) {
         if (code == null) {
             return HttpStatus.OK;
+        }
+        if (code >= BAD_REQUEST_CODE_START && code < BAD_REQUEST_CODE_END) {
+            return HttpStatus.BAD_REQUEST;
         }
         if (code >= NOT_FOUND_CODE_START && code < NOT_FOUND_CODE_END) {
             return HttpStatus.NOT_FOUND;

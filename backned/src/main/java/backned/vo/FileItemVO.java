@@ -21,8 +21,11 @@ public class FileItemVO {
 
     private String filename;
 
-    /** 字节数。换算成 KB/MB 是展示层的事，接口只给原始值，避免精度在传输中丢失 */
+    /** 字节数。换算成 KB/MB 是展示层的事，接口只给原始值，避免精度在传输中丢失。文件夹固定为 0 */
     private Long fileSize;
+
+    /** true=文件夹，false=文件。前端据此决定点进去还是下载 */
+    private Boolean isFolder;
 
     /** 上传时间，Jackson 默认序列化成 ISO-8601 字符串（2026-10-17T10:30:00） */
     private LocalDateTime createTime;

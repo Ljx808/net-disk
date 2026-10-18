@@ -57,17 +57,20 @@ CREATE TABLE IF NOT EXISTS `real_file` (
 CREATE TABLE IF NOT EXISTS `user_file` (
   `id`           bigint(20)   NOT NULL AUTO_INCREMENT,
   `user_id`      bigint(20)   NOT NULL COMMENT '所属用户',
-  `real_file_id` bigint(20)   NOT NULL COMMENT '指向 real_file.id',
+  `real_file_id` bigint(20)   DEFAULT NULL COMMENT '指向 real_file.id；文件夹行为 NULL',
   `filename`     varchar(255) NOT NULL COMMENT '原始文件名，用户看到的那个名字',
-  `parent_id`    bigint(20)   NOT NULL DEFAULT 0 COMMENT '父目录id，0=根目录。Day4 不用，为 Day5 目录结构预留',
+  `parent_id`    bigint(20)   NOT NULL DEFAULT 0 COMMENT '父目录id，0=根目录',
   `is_delete`    tinyint(4)   NOT NULL DEFAULT 0 COMMENT '0正常 1在回收站',
+  `is_folder`    tinyint(4)   NOT NULL DEFAULT 0 COMMENT '0文件 1文件夹',
   `create_time`  datetime     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `update_time`  datetime     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
-  -- 文件列表页的查询条件是"某用户 + 某目录 + 未删除"，做成联合索引
-  KEY `idx_user_parent` (`user_id`, `parent_id`, `is_delete`),
   -- 删物理文件前要反查有没有人还在用
-  KEY `idx_real_file_id` (`real_file_id`)
+  KEY `idx_real_file_id` (`real_file_id`),
+  -- 文件列表页的查询条件是"某用户 + 某目录 + 未删除"，再按"文件夹在前+创建时间倒序"排序。
+  -- is_folder 必须在 create_time 之前：只放 create_time 的话，排序第一列 is_folder 不在索引里，
+  -- 优化器仍要做 filesort，排序索引债就没真正还清。
+  KEY `idx_user_parent_time` (`user_id`, `parent_id`, `is_delete`, `is_folder`, `create_time`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户文件表(逻辑记录)';
 
 
