@@ -103,12 +103,12 @@ find /d/net-disk-storage -type f -printf '%P %s %T@\n' | sort | md5sum
 mysql -uroot -p -e "CREATE DATABASE net_disk DEFAULT CHARACTER SET utf8mb4;"
 mysql -uroot -p net_disk < docs/schema.sql
 
-# 2. 按需修改 backned/src/main/resources/application.yml
+# 2. 按需修改 backend/src/main/resources/application.yml
 #    - spring.datasource.username / password
 #    - net-disk.storage.root-path（目录需可写，不存在会自动创建）
 
-# 3. 启动后端（目录名就是 backned，历史拼写，按实际路径执行）
-cd backned
+# 3. 启动后端
+cd backend
 mvn spring-boot:run
 
 # 4. 启动前端
